@@ -52,7 +52,6 @@ class PandasDataAnalyst(BaseAgent):
     get_data_visualization_function(markdown=False)
         Returns the data visualization function as a string, optionally in Markdown.
     """
-    print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
     def __init__(
             self,
