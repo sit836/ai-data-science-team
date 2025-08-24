@@ -22,6 +22,7 @@ from ai_data_science_team import (
     PandasDataAnalyst,
     DataWranglingAgent,
     DataVisualizationAgent,
+    DataCleaningAgent,
 )
 
 # * APP INPUTS ----
@@ -177,6 +178,11 @@ pandas_data_analyst = PandasDataAnalyst(
         n_samples=100,
         log=LOG,
     ),
+    data_cleaning_agent=DataCleaningAgent(
+        model=llm,
+        n_samples=100,
+        log=LOG,
+    ),
 )
 
 # ---------------------------
@@ -248,6 +254,24 @@ if question := st.chat_input("Enter your question here:", key="query_input"):
             else:
                 st.chat_message("ai").write("No table data was returned by the agent.")
                 msgs.add_ai_message("No table data was returned by the agent.")
+
+        elif routing == "cleaning":
+            response_text = "Returning the cleaned data table."
+            data_cleaned = result.get("data_cleaned")
+            if data_cleaned is not None:
+                # Ensure data_cleaned is a DataFrame
+                if not isinstance(data_cleaned, pd.DataFrame):
+                    data_wrangled = pd.DataFrame(data_cleaned)
+                df_index = len(st.session_state.dataframes)
+                st.session_state.dataframes.append(data_cleaned)
+                msgs.add_ai_message(response_text)
+                msgs.add_ai_message(f"DATAFRAME_INDEX:{df_index}")
+                st.chat_message("ai").write(response_text)
+                st.dataframe(data_wrangled)
+            else:
+                st.chat_message("ai").write("No table data was returned by the agent.")
+                msgs.add_ai_message("No table data was returned by the agent.")
+
         else:
             # Fallback if routing decision is unclear or if chart error occurred
             data_wrangled = result.get("data_wrangled")

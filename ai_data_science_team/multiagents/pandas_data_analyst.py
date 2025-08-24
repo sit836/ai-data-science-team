@@ -32,6 +32,8 @@ class PandasDataAnalyst(BaseAgent):
         The Data Wrangling Agent for transforming raw data.
     data_visualization_agent: DataVisualizationAgent
         The Data Visualization Agent for generating plots.
+    data_cleaning_agent: DataCleaningAgent
+        The Data Cleaning Agent for cleaning data.
     checkpointer: Checkpointer (optional)
         The checkpointer to save the state of the multi-agent system.
 
@@ -50,6 +52,7 @@ class PandasDataAnalyst(BaseAgent):
     get_data_visualization_function(markdown=False)
         Returns the data visualization function as a string, optionally in Markdown.
     """
+    print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
     def __init__(
             self,
@@ -217,13 +220,13 @@ def make_pandas_data_analyst(
     class PrimaryState(TypedDict):
         messages: Annotated[Sequence[BaseMessage], operator.add]
         user_instructions: str
-        user_instructions_data_cleaning: str  # NEW
+        user_instructions_data_cleaning: str
         user_instructions_data_wrangling: str
         user_instructions_data_visualization: str
         user_instructions_data_analysis: str
         routing_preprocessor_decision: list
         data_raw: Union[dict, list]
-        data_cleaned: dict  # NEW - cleaned data
+        data_cleaned: dict
         data_wrangled: dict
         data_cleaning_function: str  # NEW
         data_wrangler_function: str
@@ -247,12 +250,9 @@ def make_pandas_data_analyst(
         return {
             "user_instructions_data_wrangling": response.get('user_instructions_data_wrangling'),
             "user_instructions_data_visualization": response.get('user_instructions_data_visualization'),
+            "user_instructions_data_cleaning": response.get('user_instructions_data_cleaning'),
             "routing_preprocessor_decision": response.get('routing_preprocessor_decision'),
         }
-
-    def router_chart_or_table(state: PrimaryState):
-        print("---ROUTER: CHART OR TABLE---")
-        return "chart" if state.get('routing_preprocessor_decision') == "chart" else "table"
 
     def router_agents(state: PrimaryState):
         """Determine which agent to invoke next based on routing decision"""
@@ -261,7 +261,7 @@ def make_pandas_data_analyst(
 
         # Check if we need to start with cleaning
         if "cleaning" in agents_to_invoke and not state.get("data_cleaned"):
-            return "data_cleaning_agent"
+            return "cleaning"
 
         # After cleaning, proceed to next agent
         current_agent = None
@@ -275,15 +275,12 @@ def make_pandas_data_analyst(
             # If no cleaning needed, get first agent
             current_agent = agents_to_invoke[0] if agents_to_invoke else None
 
-        # Map agent names to node names
         agent_mapping = {
-            "cleaning": "data_cleaning_agent",
-            "wrangling": "data_wrangling_agent",
-            "visualization": "data_visualization_agent",
-            "analysis": "data_analysis_agent"
+            "data_cleaning_agent": "cleaning",
+            "data_visualization_agent": "chart",
         }
 
-        return agent_mapping.get(current_agent, "route_printer")
+        return agent_mapping.get(current_agent, "table")
 
     def invoke_data_wrangling_agent(state: PrimaryState):
         """Use cleaned data if available, otherwise use raw data"""
@@ -359,18 +356,16 @@ def make_pandas_data_analyst(
         router_agents,
         {
             "chart": "data_visualization_agent",
-            "table": "route_printer"
+            "table": "route_printer",
+            "cleaning": "data_cleaning_agent",
         }
     )
     workflow.add_conditional_edges(
         "data_cleaning_agent",
         router_agents,
         {
-            "data_cleaning_agent": "data_cleaning_agent",
-            "data_wrangling_agent": "data_wrangling_agent",
-            "data_visualization_agent": "data_visualization_agent",
-            "data_analysis_agent": "data_analysis_agent",
-            "route_printer": "route_printer"
+            "chart": "data_visualization_agent",
+            "table": "route_printer"
         }
     )
 
