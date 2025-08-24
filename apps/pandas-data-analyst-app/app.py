@@ -78,7 +78,7 @@ openai_api_data = dict(
 # Test OpenAI API Key
 if st.session_state["OPENAI_API_KEY"]:
     # Set the API key for OpenAI
-    client = OpenAI(api_key=openai_api_data['api_key'],
+    client = OpenAI(api_key=st.session_state["OPENAI_API_KEY"],
                     base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None)
 
     # Test the API key (optional)
