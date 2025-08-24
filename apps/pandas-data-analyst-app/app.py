@@ -7,15 +7,16 @@
 # Imports
 # !pip install git+https://github.com/business-science/ai-data-science-team.git --upgrade
 
-from openai import OpenAI
+import json
+import os
 
-import streamlit as st
 import pandas as pd
 import plotly.io as pio
-import json
-
+import streamlit as st
+from dotenv import load_dotenv
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 
 from ai_data_science_team import (
     PandasDataAnalyst,
@@ -23,11 +24,12 @@ from ai_data_science_team import (
     DataVisualizationAgent,
 )
 
-
 # * APP INPUTS ----
 
-MODEL_LIST = ["gpt-4o-mini", "gpt-4o"]
+MODEL_LIST = ["deepseek-v3"]
 TITLE = "Pandas Data Analyst AI Copilot"
+
+load_dotenv()
 
 # ---------------------------
 # Streamlit App Configuration
@@ -68,10 +70,18 @@ st.session_state["OPENAI_API_KEY"] = st.sidebar.text_input(
     help="Your OpenAI API key is required for the app to function.",
 )
 
+openai_api_data = dict(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_API_BASE")
+)
+
 # Test OpenAI API Key
 if st.session_state["OPENAI_API_KEY"]:
     # Set the API key for OpenAI
-    client = OpenAI(api_key=st.session_state["OPENAI_API_KEY"])
+    client = OpenAI(api_key=openai_api_data['api_key'],
+                    base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None)
+    # client = OpenAI(api_key=openai_api_data['api_key'],
+    #                 base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None)
 
     # Test the API key (optional)
     try:
@@ -84,13 +94,11 @@ else:
     st.info("Please enter your OpenAI API Key to proceed.")
     st.stop()
 
-
 # * OpenAI Model Selection
 
 model_option = st.sidebar.selectbox("Choose OpenAI model", MODEL_LIST, index=0)
 
 llm = ChatOpenAI(model=model_option, api_key=st.session_state["OPENAI_API_KEY"])
-
 
 # ---------------------------
 # File Upload and Data Preview
