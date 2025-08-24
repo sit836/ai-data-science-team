@@ -80,8 +80,6 @@ if st.session_state["OPENAI_API_KEY"]:
     # Set the API key for OpenAI
     client = OpenAI(api_key=openai_api_data['api_key'],
                     base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None)
-    # client = OpenAI(api_key=openai_api_data['api_key'],
-    #                 base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None)
 
     # Test the API key (optional)
     try:
