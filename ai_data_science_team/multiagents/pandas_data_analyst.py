@@ -275,7 +275,6 @@ def make_pandas_data_analyst(
             current_agent = agents_to_invoke[0] if agents_to_invoke else None
 
         agent_mapping = {
-            "data_cleaning_agent": "cleaning",
             "data_visualization_agent": "chart",
         }
 
@@ -363,7 +362,8 @@ def make_pandas_data_analyst(
     workflow.add_edge("route_printer", END)
 
     app = workflow.compile(
-        checkpointer=checkpointer,
+        # checkpointer=checkpointer,
+        checkpointer=None,
         name=AGENT_NAME
     )
 

@@ -12,7 +12,8 @@ MODEL = "deepseek-v3"
 LOG = False
 LOG_PATH = os.path.join(os.getcwd(), "logs/")
 
-llm = ChatOpenAI(model=MODEL, api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE"))
+llm = ChatOpenAI(model=MODEL, api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE"),
+                 temperature=0.)
 
 df = pd.read_csv("data/bike_sales_data.csv")
 
@@ -31,13 +32,13 @@ pandas_data_analyst = PandasDataAnalyst(
     ),
     data_cleaning_agent=DataCleaningAgent(
         model=llm,
-        n_samples=300,
+        n_samples=100,
         log=LOG,
     ),
 )
 
 pandas_data_analyst.invoke_agent(
-    user_instructions = "用零补缺失数据",
+    user_instructions="用列平均补缺失",
     data_raw=df,
 )
 print(pandas_data_analyst.get_state_keys())
