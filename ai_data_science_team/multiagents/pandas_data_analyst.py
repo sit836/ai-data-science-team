@@ -348,17 +348,8 @@ def make_pandas_data_analyst(
 
     workflow.add_edge(START, "routing_preprocessor")
     workflow.add_edge("routing_preprocessor", "data_wrangling_agent")
-    workflow.add_edge("routing_preprocessor", "data_cleaning_agent")
+    workflow.add_edge("data_wrangling_agent", "data_cleaning_agent")
 
-    workflow.add_conditional_edges(
-        "data_wrangling_agent",
-        router_agents,
-        {
-            "chart": "data_visualization_agent",
-            "table": "route_printer",
-            "cleaning": "data_cleaning_agent",
-        }
-    )
     workflow.add_conditional_edges(
         "data_cleaning_agent",
         router_agents,

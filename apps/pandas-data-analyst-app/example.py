@@ -1,10 +1,8 @@
-from langchain_openai import ChatOpenAI
-import pandas as pd
 import os
-import yaml
-from pprint import pprint
+
+import pandas as pd
 from dotenv import load_dotenv
-import matplotlib.pyplot as plt
+from langchain_openai import ChatOpenAI
 
 from ai_data_science_team import PandasDataAnalyst, DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent
 
@@ -14,7 +12,7 @@ MODEL = "deepseek-v3"
 LOG = False
 LOG_PATH = os.path.join(os.getcwd(), "logs/")
 
-llm = ChatOpenAI(model=MODEL, api_key=os.getenv("OPENAI_API_KEY"),    base_url=os.getenv("OPENAI_API_BASE"))
+llm = ChatOpenAI(model=MODEL, api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE"))
 
 df = pd.read_csv("data/bike_sales_data.csv")
 
@@ -33,17 +31,16 @@ pandas_data_analyst = PandasDataAnalyst(
     ),
     data_cleaning_agent=DataCleaningAgent(
         model=llm,
-        n_samples=100,
+        n_samples=300,
         log=LOG,
     ),
 )
 
-# plt.plot(pandas_data_analyst.show(xray=1))
-# plt.show()
-
 pandas_data_analyst.invoke_agent(
-    user_instructions = "clean the data?",
+    user_instructions = "用零补缺失数据",
     data_raw=df,
 )
+print(pandas_data_analyst.get_state_keys())
 
-print(pandas_data_analyst.get_data_wrangled())
+df_cleaned = pd.DataFrame(pandas_data_analyst.response.get("data_cleaned"))
+print(df_cleaned)
