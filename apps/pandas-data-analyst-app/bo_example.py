@@ -8,12 +8,12 @@ from ai_data_science_team import PandasDataAnalyst, DataWranglingAgent, DataVisu
 
 load_dotenv()
 
-MODEL = "deepseek-v3"
+MODEL = "deepseek-chat"
 LOG = False
 LOG_PATH = os.path.join(os.getcwd(), "logs/")
 
 llm = ChatOpenAI(model=MODEL, api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE"),
-                 temperature=0.)
+                 temperature=0., max_tokens=100)
 
 df = pd.read_csv("data/bike_sales_data.csv")
 
@@ -35,13 +35,5 @@ pandas_data_analyst = PandasDataAnalyst(
         n_samples=100,
         log=LOG,
     ),
-)
 
-pandas_data_analyst.invoke_agent(
-    user_instructions="用列平均补缺失",
-    data_raw=df,
 )
-print(pandas_data_analyst.get_state_keys())
-
-df_cleaned = pd.DataFrame(pandas_data_analyst.response.get("data_cleaned"))
-print(df_cleaned)

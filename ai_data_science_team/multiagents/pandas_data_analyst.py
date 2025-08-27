@@ -13,7 +13,7 @@ import json
 from IPython.display import Markdown
 
 from ai_data_science_team.templates import BaseAgent
-from ai_data_science_team.agents import DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent
+from ai_data_science_team.agents import DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent, BayesianOptimizationAgent
 from ai_data_science_team.utils.plotly import plotly_from_dict
 from ai_data_science_team.utils.regex import remove_consecutive_duplicates, get_generic_summary
 
@@ -59,6 +59,7 @@ class PandasDataAnalyst(BaseAgent):
             data_wrangling_agent: DataWranglingAgent,
             data_visualization_agent: DataVisualizationAgent,
             data_cleaning_agent: DataCleaningAgent,
+            bayesian_opt_agent: BayesianOptimizationAgent,
             checkpointer: Checkpointer = None,
     ):
         self._params = {
@@ -66,6 +67,7 @@ class PandasDataAnalyst(BaseAgent):
             "data_wrangling_agent": data_wrangling_agent,
             "data_visualization_agent": data_visualization_agent,
             "data_cleaning_agent": data_cleaning_agent,
+            "bayesian_opt_agent": bayesian_opt_agent ,
             "checkpointer": checkpointer,
         }
         self._compiled_graph = self._make_compiled_graph()
@@ -79,6 +81,7 @@ class PandasDataAnalyst(BaseAgent):
             data_cleaning_agent=self._params["data_cleaning_agent"]._compiled_graph,
             data_wrangling_agent=self._params["data_wrangling_agent"]._compiled_graph,
             data_visualization_agent=self._params["data_visualization_agent"]._compiled_graph,
+            bayesian_opt_agent=self._params["bayesian_opt_agent"]._compiled_graph,
             checkpointer=self._params["checkpointer"],
         )
 
@@ -164,6 +167,7 @@ def make_pandas_data_analyst(
         data_cleaning_agent: CompiledStateGraph,
         data_wrangling_agent: CompiledStateGraph,
         data_visualization_agent: CompiledStateGraph,
+        bayesian_opt_agent: CompiledStateGraph,
         checkpointer: Checkpointer = None
 ):
     """
@@ -250,6 +254,7 @@ def make_pandas_data_analyst(
             "user_instructions_data_wrangling": response.get('user_instructions_data_wrangling'),
             "user_instructions_data_visualization": response.get('user_instructions_data_visualization'),
             "user_instructions_data_cleaning": response.get('user_instructions_data_cleaning'),
+            "user_instructions_bayesian_opt": response.get('user_instructions_bayesian_opt'),
             "routing_preprocessor_decision": response.get('routing_preprocessor_decision'),
         }
 
