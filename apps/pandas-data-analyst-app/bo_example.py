@@ -4,7 +4,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from ai_data_science_team import PandasDataAnalyst, DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent
+from ai_data_science_team import PandasDataAnalyst, DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent, \
+    BayesianOptimizationAgent
 
 load_dotenv()
 
@@ -35,5 +36,9 @@ pandas_data_analyst = PandasDataAnalyst(
         n_samples=100,
         log=LOG,
     ),
-
+    bayesian_opt_agent=BayesianOptimizationAgent(
+        model=llm,
+        n_samples=100,
+        log=LOG,
+    )
 )
