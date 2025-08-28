@@ -1,22 +1,21 @@
-import json
-import operator
 import os
-from typing import Any, Optional, Annotated, Sequence, List, Dict, Tuple
+from typing import Any
 
 import pandas as pd
-import numpy as np
-from langchain_core.messages import BaseMessage, AIMessage
-from langgraph.graph import START, END, StateGraph
-from langgraph.prebuilt import create_react_agent, ToolNode
-from langgraph.prebuilt.chat_agent_executor import AgentState
+import torch
+from botorch.acquisition import LogExpectedImprovement
+from botorch.fit import fit_gpytorch_mll
+from botorch.models import SingleTaskGP
+from botorch.models.transforms import Normalize, Standardize
+from botorch.optim import optimize_acqf
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
 from langgraph.types import Checkpointer
-from scipy.stats import norm
 
 from ai_data_science_team.templates import BaseAgent
-from ai_data_science_team.utils.messages import get_tool_call_names
 from ai_data_science_team.utils.regex import format_agent_name
-
-# TODO: tools folder, add get_recommendation.py
 
 # Setup
 AGENT_NAME = "bayesian_optimization_agent"
@@ -124,16 +123,105 @@ class BayesianOptimizationAgent(BaseAgent):
         return None
 
 
+@tool
+def get_recommendations(X, Y, num_recommendations=1, optimize_direction="maximize"):
+    """Find optimal recommendations with Bayesian optimization.
+
+    Args:
+        X (torch.Tensor): (n, d) input parameters
+        Y (torch.Tensor): (n,) or (n, 1) target values
+        num_recommendations (int): number of recommendations to return
+        optimize_direction (str): "maximize" or "minimize"
+
+    Returns:
+        torch.Tensor: (1, d) recommended parameter configuration
+    """
+
+    def _build_bounds_from_data(X: torch.Tensor) -> torch.Tensor:
+        """Build [2, d] bounds tensor from observed data X (min/max per column)."""
+        col_min = X.min(dim=0).values
+        col_max = X.max(dim=0).values
+        return torch.stack([col_min, col_max]).to(dtype=torch.double)
+
+    X = torch.tensor(X, dtype=torch.double)
+    Y = torch.tensor(Y, dtype=torch.double)
+    if Y.ndim == 1:
+        Y = Y.unsqueeze(-1)
+    if optimize_direction == "minimize":
+        Y = -Y
+
+    dim_inputs = X.shape[1]
+
+    model = SingleTaskGP(
+        train_X=X,
+        train_Y=Y,
+        input_transform=Normalize(d=dim_inputs),
+        outcome_transform=Standardize(m=1),
+    )
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_mll(mll)
+
+    acqf = LogExpectedImprovement(model=model, best_f=Y.max())
+    bounds = _build_bounds_from_data(X)
+
+    candidate, _ = optimize_acqf(
+        acqf,
+        bounds=bounds,
+        q=num_recommendations,
+        num_restarts=1,
+        raw_samples=64,
+    )
+    return candidate
+
+
 def make_bo_agent(model,
                   n_samples=30,
                   log=False,
                   log_path=None,
-                  file_name="data_cleaner.py",
-                  function_name="data_cleaner",
+                  # file_name="data_cleaner.py",
+                  # function_name="data_cleaner",
                   overwrite=True,
                   human_in_the_loop=False,
                   bypass_recommended_steps=False,
                   bypass_explain_code=False,
                   checkpointer: Checkpointer = None
                   ):
-    pass
+    print(format_agent_name(AGENT_NAME))
+
+    tools = [get_recommendations]
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a helpful assistant"),
+            ("placeholder", "{chat_history}"),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ]
+    )
+    agent = create_tool_calling_agent(model, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    result = agent_executor.invoke(
+        {
+            "input": "Take 3 to the fifth power and multiply that by the sum of twelve and three, then square the whole result"
+        }
+    )
+    print("Agent response:", result)
+
+
+def test_agent_with_tools():
+    X, Y = create_test_data()
+
+    # Create a simple test model (you might need to adjust based on your actual model)
+    from langchain_openai import ChatOpenAI
+
+    # Use a simple model for testing
+    test_model = ChatOpenAI(temperature=0)  # or whatever model you're using
+
+    agent_executor = make_bo_agent(test_model)
+
+    # Test query that should trigger the tool
+    test_query = "I have input parameters [[1,2,3],[2,3,1],[3,1,2],[4,5,6],[5,6,4]] and target values [10,15,12,25,30]. Can you get recommendations for me?"
+
+    result = agent_executor.invoke({"input": test_query})
+    print("Agent test results:", result)
+    return result
