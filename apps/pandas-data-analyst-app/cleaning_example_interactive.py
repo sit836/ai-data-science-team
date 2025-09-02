@@ -68,7 +68,7 @@ def interactive_cleaning_session():
             print(f"\n执行指令: {user_instructions}")
             agent.invoke_agent(
                 user_instructions=user_instructions,
-                data_raw=current_data,  # 使用当前数据而不是原始数据
+                data_raw=current_data,
                 config=config
             )
 
