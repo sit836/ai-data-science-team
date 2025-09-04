@@ -69,16 +69,8 @@ class DataCleaningApp:
                 else:
                     categorical_cols.append(col)
 
-            # 询问缺失原因
-            # TODO： 删掉写死的选项
-            print("\n🔍 请帮助我了解这些缺失值的原因:")
-            print("1. 数据收集时遗漏")
-            print("2. 数据录入错误")
-            print("3. 特定条件下的自然缺失（如未购买产品的客户没有购买记录）")
-            print("4. 其他原因")
-
             while True:
-                missing_reason = input("\n请选择缺失值的主要原因（输入数字）或描述具体情况: ")
+                missing_reason = input("🔍 请帮助我了解这些缺失值的原因: ")
                 if missing_reason.strip():  # 确保输入不为空
                     break
                 print("❌ 输入不能为空，请重新输入")
@@ -546,31 +538,31 @@ class DataCleaningApp:
                 print(f"❌ 自定义处理错误: {e}")
                 return self.apply_default_solution(df, self.detect_outliers(df))
 
-    def detect_outliers(self, df):
-        """检测数据中的异常值"""
-        numeric_columns = df.select_dtypes(include=['int64', 'float64']).columns
-        outlier_columns = {}
+        def detect_outliers(self, df):
+            """检测数据中的异常值"""
+            numeric_columns = df.select_dtypes(include=['int64', 'float64']).columns
+            outlier_columns = {}
 
-        for col in numeric_columns:
-            Q1 = df[col].quantile(0.25)
-            Q3 = df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
+            for col in numeric_columns:
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
 
-            outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
-            outlier_count = len(outliers)
+                outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+                outlier_count = len(outliers)
 
-            if outlier_count > 0:
-                percentage = (outlier_count / len(df)) * 100
-                outlier_columns[col] = {
-                    'count': outlier_count,
-                    'percentage': percentage,
-                    'lower_bound': lower_bound,
-                    'upper_bound': upper_bound
-                }
+                if outlier_count > 0:
+                    percentage = (outlier_count / len(df)) * 100
+                    outlier_columns[col] = {
+                        'count': outlier_count,
+                        'percentage': percentage,
+                        'lower_bound': lower_bound,
+                        'upper_bound': upper_bound
+                    }
 
-        return outlier_columns
+            return outlier_columns
 
     def detect_data_issues(self):
         """检测数据中的所有问题"""
