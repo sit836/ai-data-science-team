@@ -70,6 +70,7 @@ class DataCleaningApp:
                     categorical_cols.append(col)
 
             # 询问缺失原因
+            # TODO： 删掉写死的选项
             print("\n🔍 请帮助我了解这些缺失值的原因:")
             print("1. 数据收集时遗漏")
             print("2. 数据录入错误")
