@@ -1,6 +1,7 @@
 import os
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import torch
 from botorch.acquisition import LogExpectedImprovement
@@ -8,6 +9,7 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
 from botorch.models.transforms import Normalize, Standardize
 from botorch.optim import optimize_acqf
+from dotenv import load_dotenv
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
@@ -53,12 +55,12 @@ class BayesianOptimizationAgent(BaseAgent):
         self._compiled_graph = self._make_compiled_graph()
         self.response = None
 
-        def _make_compiled_graph(self):
-            """
-            Create the compiled graph for the Bayesian optimization agent. Running this method will reset the response to None.
-            """
-            self.response = None
-            return make_bo_agent(**self._params)
+    def _make_compiled_graph(self):
+        """
+        Create the compiled graph for the Bayesian optimization agent. Running this method will reset the response to None.
+        """
+        self.response = None
+        return make_bo_agent(**self._params)
 
     async def ainvoke_agent(self, data_raw: pd.DataFrame, user_instructions: str = None, max_retries: int = 3,
                             retry_count: int = 0, **kwargs):
@@ -208,20 +210,18 @@ def make_bo_agent(model,
     print("Agent response:", result)
 
 
-def test_agent_with_tools():
-    X, Y = create_test_data()
+if __name__ == '__main__':
+    X, Y = np.array([[1, 2, 3], [1, 2, 2], [4, 3, 4]]), np.array([[1, 12, 3]])
 
-    # Create a simple test model (you might need to adjust based on your actual model)
     from langchain_openai import ChatOpenAI
 
-    # Use a simple model for testing
-    test_model = ChatOpenAI(temperature=0)  # or whatever model you're using
+    load_dotenv()
 
-    agent_executor = make_bo_agent(test_model)
+    llm = ChatOpenAI(model="deepseek-chat", api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE"),
+                     temperature=0., max_tokens=100)
+    agent_executor = make_bo_agent(llm)
 
-    # Test query that should trigger the tool
-    test_query = "I have input parameters [[1,2,3],[2,3,1],[3,1,2],[4,5,6],[5,6,4]] and target values [10,15,12,25,30]. Can you get recommendations for me?"
+    test_query = "I have input parameters [[1,2,3],[2,3,1],[3,1,2],[4,5,6],[5,6,4]] and target values [10,15,12,25,30]. Can you get recommendations to maximize target"
 
     result = agent_executor.invoke({"input": test_query})
     print("Agent test results:", result)
-    return result

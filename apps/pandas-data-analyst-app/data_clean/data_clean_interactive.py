@@ -25,8 +25,7 @@ class DataCleaningApp:
         )
         self.original_df = pd.read_csv("../data/bike_sales_data.csv")
         self.current_data = self.original_df.copy()
-        self.missing_values_handled = False
-        self.duplicates_handled = False
+        self.processing_steps = []  # 存储需要执行的处理步骤
 
     class MissingValueHandler:
         """缺失值处理处理器"""
@@ -46,14 +45,29 @@ class DataCleaningApp:
 
             if len(missing_columns) == 0:
                 print("✅ 数据中没有缺失值！")
-                self.app.missing_values_handled = True
-                return current_data
+                return current_data, True
 
             # 打印缺失情况
             print("发现缺失值的列:")
             for col, count in missing_columns.items():
                 percentage = (count / len(current_data)) * 100
                 print(f"  - {col}: {count} 个缺失值 ({percentage:.2f}%)")
+
+            # 按数据类型分组处理缺失值
+            numeric_cols = []
+            categorical_cols = []
+            high_missing_cols = []
+
+            for col in missing_columns.index:
+                col_type = current_data[col].dtype
+                missing_percentage = (missing_counts[col] / len(current_data)) * 100
+
+                if missing_percentage > 50:
+                    high_missing_cols.append(col)
+                elif col_type in ['int64', 'float64']:
+                    numeric_cols.append(col)
+                else:
+                    categorical_cols.append(col)
 
             # 询问缺失原因
             print("\n🔍 请帮助我了解这些缺失值的原因:")
@@ -68,27 +82,28 @@ class DataCleaningApp:
                     break
                 print("❌ 输入不能为空，请重新输入")
 
-            # 协商解决方案
+            # 协商解决方案 - 按数据类型分组处理
             print("\n💡 基于您的描述，我建议以下处理方案:")
 
             solutions = []
-            for col in missing_columns.index:
-                col_type = current_data[col].dtype
-                missing_count = missing_counts[col]
-                missing_percentage = (missing_count / len(current_data)) * 100
 
-                if missing_percentage > 50:
-                    solution = f"删除列 '{col}' (缺失值超过50%)"
-                    solutions.append((col, solution, "delete_column"))
-                elif col_type in ['int64', 'float64']:
-                    solution = f"数值列 '{col}' 使用中位数填充"
-                    solutions.append((col, solution, "median_impute"))
-                else:
-                    solution = f"分类列 '{col}' 使用众数填充"
-                    solutions.append((col, solution, "mode_impute"))
+            # 处理高缺失率列
+            for col in high_missing_cols:
+                solution = f"删除列 '{col}' (缺失值超过50%)"
+                solutions.append((col, solution, "delete_column", "high_missing"))
+
+            # 处理数值列
+            if numeric_cols:
+                numeric_solution = f"数值列 {numeric_cols} 使用中位数填充"
+                solutions.append((numeric_cols, numeric_solution, "median_impute", "numeric"))
+
+            # 处理分类列
+            if categorical_cols:
+                categorical_solution = f"分类列 {categorical_cols} 使用众数填充"
+                solutions.append((categorical_cols, categorical_solution, "mode_impute", "categorical"))
 
             # 显示建议方案
-            for i, (col, solution, _) in enumerate(solutions, 1):
+            for i, (cols, solution, _, _) in enumerate(solutions, 1):
                 print(f"{i}. {solution}")
 
             print(f"{len(solutions) + 1}. 自定义处理方案")
@@ -120,27 +135,31 @@ class DataCleaningApp:
                 result = current_data
             else:
                 # 应用选择的方案
-                col, _, action = solutions[choice - 1]
-                result = self.apply_solution(current_data, col, action)
+                cols, _, action, col_type = solutions[choice - 1]
+                result = self.apply_solution(current_data, cols, action, col_type)
 
-            # 标记缺失值已处理
-            self.app.missing_values_handled = True
-            return result
+            return result, True
 
-        def apply_solution(self, df, column, action):
+        def apply_solution(self, df, columns, action, col_type):
             """应用特定的缺失值处理方案"""
+            if isinstance(columns, str):
+                columns = [columns]
+
             if action == "delete_column":
-                print(f"🗑️ 删除列: {column}")
-                return df.drop(columns=[column])
+                for col in columns:
+                    print(f"🗑️ 删除列: {col}")
+                return df.drop(columns=columns)
             elif action == "median_impute":
-                median_val = df[column].median()
-                print(f"🔢 使用中位数填充 {column}: {median_val}")
-                df[column] = df[column].fillna(median_val)
+                for col in columns:
+                    median_val = df[col].median()
+                    print(f"🔢 使用中位数填充 {col}: {median_val}")
+                    df[col] = df[col].fillna(median_val)
                 return df
             elif action == "mode_impute":
-                mode_val = df[column].mode()[0] if not df[column].mode().empty else "Unknown"
-                print(f"🏷️ 使用众数填充 {column}: {mode_val}")
-                df[column] = df[column].fillna(mode_val)
+                for col in columns:
+                    mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
+                    print(f"🏷️ 使用众数填充 {col}: {mode_val}")
+                    df[col] = df[col].fillna(mode_val)
                 return df
             else:
                 return df
@@ -149,22 +168,38 @@ class DataCleaningApp:
             """应用默认的缺失值处理方案"""
             print("🔄 应用默认缺失值处理方案")
 
+            # 按数据类型分组处理
+            numeric_cols = []
+            categorical_cols = []
+            high_missing_cols = []
+
             for col in missing_columns.index:
                 col_type = df[col].dtype
-                missing_count = missing_columns[col]
-                missing_percentage = (missing_count / len(df)) * 100
+                missing_percentage = (missing_columns[col] / len(df)) * 100
 
                 if missing_percentage > 50:
-                    print(f"🗑️ 删除列 {col} (缺失值超过50%)")
-                    df = df.drop(columns=[col])
+                    high_missing_cols.append(col)
                 elif col_type in ['int64', 'float64']:
-                    median_val = df[col].median()
-                    print(f"🔢 使用中位数填充 {col}: {median_val}")
-                    df[col] = df[col].fillna(median_val)
+                    numeric_cols.append(col)
                 else:
-                    mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
-                    print(f"🏷️ 使用众数填充 {col}: {mode_val}")
-                    df[col] = df[col].fillna(mode_val)
+                    categorical_cols.append(col)
+
+            # 处理高缺失率列
+            if high_missing_cols:
+                print(f"🗑️ 删除列 {high_missing_cols} (缺失值超过50%)")
+                df = df.drop(columns=high_missing_cols)
+
+            # 处理数值列
+            for col in numeric_cols:
+                median_val = df[col].median()
+                print(f"🔢 使用中位数填充 {col}: {median_val}")
+                df[col] = df[col].fillna(median_val)
+
+            # 处理分类列
+            for col in categorical_cols:
+                mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
+                print(f"🏷️ 使用众数填充 {col}: {mode_val}")
+                df[col] = df[col].fillna(mode_val)
 
             return df
 
@@ -223,8 +258,7 @@ class DataCleaningApp:
 
             if duplicate_count == 0:
                 print("✅ 数据中没有重复行！")
-                self.app.duplicates_handled = True
-                return current_data
+                return current_data, True
 
             print(f"发现 {duplicate_count} 个重复行")
 
@@ -235,43 +269,23 @@ class DataCleaningApp:
 
             # 协商解决方案
             print("\n💡 请选择处理重复值的方式:")
-            print("1. 删除所有完全重复的行")
-            print("2. 基于关键列删除重复行")
-            print("3. 保留第一个出现的重复行，删除后续的")
-            print("4. 保留最后一个出现的重复行，删除前面的")
-            print("5. 自定义处理方案")
+            print("1. 保留第一个出现的重复行，删除后续的")
+            print("2. 自定义处理方案")
 
             while True:
                 choice = input("\n请选择处理方案（输入数字）: ")
                 try:
                     choice = int(choice)
-                    if 1 <= choice <= 5:
+                    if 1 <= choice <= 2:
                         break
                     else:
-                        print("❌ 请输入 1 到 5 之间的数字")
+                        print("❌ 请输入 1 到 2 之间的数字")
                 except ValueError:
                     print("❌ 请输入有效的数字")
 
             if choice == 1:
-                result = self.remove_all_duplicates(current_data)
-            elif choice == 2:
-                while True:
-                    key_columns = input("请输入关键列名（用逗号分隔）: ").split(',')
-                    key_columns = [col.strip() for col in key_columns if col.strip()]
-                    if key_columns:
-                        # 验证列名是否存在
-                        invalid_cols = [col for col in key_columns if col not in current_data.columns]
-                        if not invalid_cols:
-                            break
-                        print(f"❌ 以下列名不存在: {invalid_cols}")
-                    else:
-                        print("❌ 请输入至少一个有效的列名")
-                result = self.remove_duplicates_by_columns(current_data, key_columns)
-            elif choice == 3:
                 result = self.remove_duplicates_keep_first(current_data)
-            elif choice == 4:
-                result = self.remove_duplicates_keep_last(current_data)
-            elif choice == 5:
+            elif choice == 2:
                 while True:
                     custom_instruction = input("请输入自定义处理指令: ")
                     if custom_instruction.strip():
@@ -279,9 +293,7 @@ class DataCleaningApp:
                     print("❌ 指令不能为空，请重新输入")
                 result = self.apply_custom_solution(current_data, custom_instruction)
 
-            # 标记重复值已处理
-            self.app.duplicates_handled = True
-            return result
+            return result, True
 
         def remove_all_duplicates(self, df):
             """删除所有完全重复的行"""
@@ -358,15 +370,6 @@ class DataCleaningApp:
 
         def handle_interactive(self, current_data):
             """处理异常值的交互式流程"""
-            # 检查是否已经处理了缺失值和重复行
-            if not self.app.missing_values_handled:
-                print("❌ 请先处理缺失值！")
-                return current_data
-
-            if not self.app.duplicates_handled:
-                print("❌ 请先处理重复行！")
-                return current_data
-
             print("\n" + "=" * 60)
             print("异常值处理向导")
             print("=" * 60)
@@ -376,7 +379,7 @@ class DataCleaningApp:
 
             if len(outlier_columns) == 0:
                 print("✅ 数据中没有检测到明显的异常值！")
-                return current_data
+                return current_data, True
 
             # 打印异常值情况
             print("检测到异常值的数值列:")
@@ -385,15 +388,15 @@ class DataCleaningApp:
                 print(f"    正常值范围: [{info['lower_bound']:.2f}, {info['upper_bound']:.2f}]")
 
             # 询问异常值原因
-            print("\n🔍 请帮助我了解这些异常值的原因:")
-            print("1. 数据录入错误")
-            print("2. 测量误差")
-            print("3. 真实但罕见的极端值")
-            print("4. 数据处理错误")
-            print("5. 其他原因")
+            # print("\n🔍 请帮助我了解这些异常值的原因")
+            # print("1. 数据录入错误")
+            # print("2. 测量误差")
+            # print("3. 真实但罕见的极端值")
+            # print("4. 数据处理错误")
+            # print("5. 其他原因")
 
             while True:
-                outlier_reason = input("\n请选择异常值的主要原因（输入数字）或描述具体情况: ")
+                outlier_reason = input("🔍 请帮助我了解这些异常值的原因: ")
                 if outlier_reason.strip():
                     break
                 print("❌ 输入不能为空，请重新输入")
@@ -443,11 +446,11 @@ class DataCleaningApp:
             elif choice == len(solutions) + 2:
                 # 跳过
                 print("⏭️ 跳过异常值处理")
-                return current_data
+                return current_data, True
             else:
                 # 应用选择的方案
                 col, _, action = solutions[choice - 1]
-                return self.apply_solution(current_data, col, action)
+                return self.apply_solution(current_data, col, action), True
 
         def apply_solution(self, df, column, action):
             """应用特定的异常值处理方案"""
@@ -542,31 +545,71 @@ class DataCleaningApp:
                 print(f"❌ 自定义处理错误: {e}")
                 return self.apply_default_solution(df, self.detect_outliers(df))
 
-        def detect_outliers(self, df):
-            """检测数据中的异常值"""
-            numeric_columns = df.select_dtypes(include=['int64', 'float64']).columns
-            outlier_columns = {}
+    def detect_outliers(self, df):
+        """检测数据中的异常值"""
+        numeric_columns = df.select_dtypes(include=['int64', 'float64']).columns
+        outlier_columns = {}
 
-            for col in numeric_columns:
-                Q1 = df[col].quantile(0.25)
-                Q3 = df[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
+        for col in numeric_columns:
+            Q1 = df[col].quantile(0.25)
+            Q3 = df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
 
-                outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
-                outlier_count = len(outliers)
+            outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+            outlier_count = len(outliers)
 
-                if outlier_count > 0:
-                    percentage = (outlier_count / len(df)) * 100
-                    outlier_columns[col] = {
-                        'count': outlier_count,
-                        'percentage': percentage,
-                        'lower_bound': lower_bound,
-                        'upper_bound': upper_bound
-                    }
+            if outlier_count > 0:
+                percentage = (outlier_count / len(df)) * 100
+                outlier_columns[col] = {
+                    'count': outlier_count,
+                    'percentage': percentage,
+                    'lower_bound': lower_bound,
+                    'upper_bound': upper_bound
+                }
 
-            return outlier_columns
+        return outlier_columns
+
+    def detect_data_issues(self):
+        """检测数据中的所有问题"""
+        issues = []
+
+        # 检测缺失值
+        missing_counts = self.current_data.isnull().sum()
+        missing_columns = missing_counts[missing_counts > 0]
+        if len(missing_columns) > 0:
+            issues.append(('missing', f"发现 {len(missing_columns)} 列有缺失值"))
+
+        # 检测重复值
+        duplicate_count = self.current_data.duplicated().sum()
+        if duplicate_count > 0:
+            issues.append(('duplicate', f"发现 {duplicate_count} 个重复行"))
+
+        # 检测异常值
+        outlier_columns = self.detect_outliers(self.current_data)
+        if len(outlier_columns) > 0:
+            issues.append(('outlier', f"发现 {len(outlier_columns)} 列有异常值"))
+
+        return issues
+
+    def run_data_diagnosis(self):
+        """运行数据诊断，检测所有问题"""
+        print("\n" + "=" * 60)
+        print("数据诊断报告")
+        print("=" * 60)
+
+        issues = self.detect_data_issues()
+
+        if not issues:
+            print("✅ 数据质量良好，未发现明显问题！")
+            return []
+
+        print("发现以下数据问题:")
+        for i, (issue_type, description) in enumerate(issues, 1):
+            print(f"{i}. {description}")
+
+        return issues
 
     def interactive_cleaning_session(self):
         """交互式数据清洗会话"""
@@ -587,167 +630,182 @@ class DataCleaningApp:
             print(f"当前数据形状: {self.current_data.shape}")
             print("数据列:", list(self.current_data.columns))
 
-            # 显示处理状态
-            print(f"\n处理状态:")
-            print(f"缺失值处理: {'✅' if self.missing_values_handled else '❌'}")
-            print(f"重复值处理: {'✅' if self.duplicates_handled else '❌'}")
+            # 运行数据诊断
+            issues = self.run_data_diagnosis()
 
-            print("\n前3行数据:")
-            print(self.current_data.head(3))
+            if not issues:
+                # 如果没有发现问题，询问用户下一步操作
+                print("\n✅ 数据质量良好，未发现明显问题！")
+                print("\n您可以选择:")
+                print("1. 执行自定义清洗指令")
+                print("2. 重置数据到原始状态")
+                print("3. 退出程序")
 
-            # 显示数据基本信息
-            print(f"\n数据基本信息:")
-            print(f"缺失值数量: {self.current_data.isnull().sum().sum()}")
-            if self.current_data.isnull().sum().sum() > 0:
-                missing_counts = self.current_data.isnull().sum()
-                missing_columns = missing_counts[missing_counts > 0]
-                print("缺失值分布:")
-                for col, count in missing_columns.items():
-                    percentage = (count / len(self.current_data)) * 100
-                    print(f"  - {col}: {count} 个缺失值 ({percentage:.2f}%)")
+                while True:
+                    choice = input("\n请选择下一步操作（输入数字）: ")
+                    if choice == '1':
+                        while True:
+                            user_instructions = input("请输入自定义清洗指令: ")
+                            if user_instructions.strip():
+                                break
+                            print("❌ 指令不能为空，请重新输入")
+                        self.execute_custom_cleaning(user_instructions, config)
+                        break
+                    elif choice == '2':
+                        self.current_data = self.original_df.copy()
+                        print("✅ 数据已重置为原始数据")
+                        break
+                    elif choice == '3':
+                        print("👋 感谢使用数据清洗工具，再见！")
+                        return
+                    else:
+                        print("❌ 请输入有效的选项（1-3）")
+                continue
 
-            print(f"重复行数量: {self.current_data.duplicated().sum()}")
+            # 引导用户依次处理每个问题
+            print(f"\n📋 共发现 {len(issues)} 个数据问题，我将引导您依次处理:")
 
-            # 提供选项菜单
-            print("\n请选择操作:")
-            print("1. 处理缺失值")
-            print("2. 处理重复值")
-            print("3. 处理异常值")
-            print("4. 数据类型转换")
-            print("5. 自定义清洗指令")
-            print("6. 重置数据")
-            print("7. 退出")
+            for i, (issue_type, description) in enumerate(issues, 1):
+                print(f"\n{'=' * 50}")
+                print(f"处理问题 {i}/{len(issues)}: {description}")
+                print(f"{'=' * 50}")
+
+                if issue_type == 'missing':
+                    print("🔍 正在处理缺失值问题...")
+                    self.current_data, _ = missing_handler.handle_interactive(self.current_data)
+                elif issue_type == 'duplicate':
+                    print("🔍 正在处理重复值问题...")
+                    self.current_data, _ = duplicate_handler.handle_interactive(self.current_data)
+                elif issue_type == 'outlier':
+                    print("🔍 正在处理异常值问题...")
+                    self.current_data, _ = outlier_handler.handle_interactive(self.current_data)
+
+                # 显示处理后的数据状态
+                print(f"\n✅ 当前数据形状: {self.current_data.shape}")
+
+                # 询问是否继续处理下一个问题
+                if i < len(issues):
+                    while True:
+                        continue_choice = input(f"\n是否继续处理下一个问题？(y/n): ").lower()
+                        if continue_choice in ['y', 'yes', '是']:
+                            break
+                        elif continue_choice in ['n', 'no', '否']:
+                            print("⏭️ 跳过剩余问题处理")
+                            break
+                        else:
+                            print("❌ 请输入 y/n 或 是/否")
+
+                    if continue_choice in ['n', 'no', '否']:
+                        break
+
+            # 所有问题处理完成后，提供额外选项
+            print(f"\n{'=' * 60}")
+            print("所有检测到的问题已处理完成！")
+            print(f"{'=' * 60}")
 
             while True:
+                print("\n请选择下一步操作:")
+                print("1. 重新检测数据问题")
+                print("2. 执行自定义清洗指令")
+                print("3. 保存当前数据")
+                print("4. 重置数据到原始状态")
+                print("5. 退出程序")
+
                 choice = input("\n请输入选项数字: ")
-                if choice in ['1', '2', '3', '4', '5', '6', '7']:
-                    break
-                print("❌ 无效选项，请输入 1-7 之间的数字")
 
-            if choice == '7':
-                break
-            elif choice == '6':
-                self.current_data = self.original_df.copy()
-                self.missing_values_handled = False
-                self.duplicates_handled = False
-                print("✅ 数据已重置为原始数据")
-                continue
-            elif choice == '1':
-                # 处理缺失值
-                self.current_data = missing_handler.handle_interactive(self.current_data)
-                continue
-            elif choice == '2':
-                # 处理重复值
-                self.current_data = duplicate_handler.handle_interactive(self.current_data)
-                continue
-            elif choice == '3':
-                # 处理异常值（会检查前置条件）
-                self.current_data = outlier_handler.handle_interactive(self.current_data)
-                continue
-            elif choice in ['4', '5']:
-                # 检查前置条件
-                if not self.missing_values_handled:
-                    print("❌ 请先处理缺失值！")
-                    continue
-                if not self.duplicates_handled:
-                    print("❌ 请先处理重复行！")
-                    continue
-
-                if choice == '4':
-                    user_instructions = "自动检测并转换数据类型"
-                else:
+                if choice == '1':
+                    break  # 重新开始循环，再次检测问题
+                elif choice == '2':
                     while True:
                         user_instructions = input("请输入自定义清洗指令: ")
                         if user_instructions.strip():
                             break
                         print("❌ 指令不能为空，请重新输入")
+                    self.execute_custom_cleaning(user_instructions, config)
+                elif choice == '3':
+                    output_path = input("请输入保存路径（默认: cleaned_data.csv）: ") or "cleaned_data.csv"
+                    self.current_data.to_csv(output_path, index=False)
+                    print(f"✅ 数据已保存到 {output_path}")
+                elif choice == '4':
+                    self.current_data = self.original_df.copy()
+                    print("✅ 数据已重置为原始数据")
+                    break  # 重新检测问题
+                elif choice == '5':
+                    print("👋 感谢使用数据清洗工具，再见！")
+                    return
+                else:
+                    print("❌ 请输入有效的选项（1-5）")
 
-                try:
-                    # 创建新的agent实例，使用当前数据
-                    agent = DataCleaningAgent(
-                        model=self.llm,
-                        log=self.LOG,
-                        log_path=self.LOG_PATH,
-                        human_in_the_loop=True,
-                    )
+    def execute_custom_cleaning(self, user_instructions, config):
+        """执行自定义清洗指令"""
+        try:
+            # 创建新的agent实例，使用当前数据
+            agent = DataCleaningAgent(
+                model=self.llm,
+                log=self.LOG,
+                log_path=self.LOG_PATH,
+                human_in_the_loop=True,
+            )
 
-                    # 执行清洗
-                    print(f"\n执行指令: {user_instructions}")
-                    agent.invoke_agent(
-                        user_instructions=user_instructions,
-                        data_raw=self.current_data,
-                        config=config
-                    )
+            # 执行清洗
+            print(f"\n执行指令: {user_instructions}")
+            agent.invoke_agent(
+                user_instructions=user_instructions,
+                data_raw=self.current_data,
+                config=config
+            )
 
-                    # 获取状态
-                    state = agent._compiled_graph.get_state(config=config)
+            # 获取状态
+            state = agent._compiled_graph.get_state(config=config)
 
-                    human_review_required = False
-                    if state and hasattr(state, 'next') and state.next:
-                        human_review_required = True
-                        print("\n🔍 系统需要人类审查:")
+            if state and hasattr(state, 'next') and state.next:
+                print("\n🔍 系统需要人类审查:")
 
-                        # 尝试获取审查问题
-                        question = "请确认清洗指令是否正确？"
-                        if hasattr(state.next[0], 'tasks') and state.next[0].tasks:
-                            if state.next[0].tasks[-1].interrupts:
-                                question = state.next[0].tasks[-1].interrupts[-1].value
-                        elif hasattr(state.next[0], 'value'):
-                            question = state.next[0].value
+                # 尝试获取审查问题
+                question = "请确认清洗指令是否正确？"
+                if hasattr(state.next[0], 'tasks') and state.next[0].tasks:
+                    if state.next[0].tasks[-1].interrupts:
+                        question = state.next[0].tasks[-1].interrupts[-1].value
+                elif hasattr(state.next[0], 'value'):
+                    question = state.next[0].value
 
-                        print(f"问题: {question}")
+                print(f"问题: {question}")
 
-                        while True:
-                            human_response = input("请输入您的响应（'yes' 继续或提供修改建议）: ")
-                            if human_response.strip():
-                                break
-                            print("❌ 响应不能为空，请重新输入")
+                while True:
+                    human_response = input("请输入您的响应（'yes' 继续或提供修改建议）: ")
+                    if human_response.strip():
+                        break
+                    print("❌ 响应不能为空，请重新输入")
 
-                        # 继续处理
-                        agent._compiled_graph.invoke(
-                            {"resume": human_response},
-                            config=config
-                        )
+                # 继续处理
+                agent._compiled_graph.invoke(
+                    {"resume": human_response},
+                    config=config
+                )
 
-                    # 获取最终结果
-                    final_state = agent._compiled_graph.get_state(config=config)
+            # 获取最终结果
+            final_state = agent._compiled_graph.get_state(config=config)
 
-                    if final_state and hasattr(final_state, 'values'):
-                        if 'data_cleaned' in final_state.values:
-                            cleaned_df = pd.DataFrame(final_state.values['data_cleaned'])
+            if final_state and hasattr(final_state, 'values'):
+                if 'data_cleaned' in final_state.values:
+                    cleaned_df = pd.DataFrame(final_state.values['data_cleaned'])
 
-                            print(f"\n✅ 清洗完成！")
-                            print(f"处理前形状: {self.current_data.shape}")
-                            print(f"处理后形状: {cleaned_df.shape}")
+                    print(f"\n✅ 清洗完成！")
+                    print(f"处理前形状: {self.current_data.shape}")
+                    print(f"处理后形状: {cleaned_df.shape}")
 
-                            # 更新当前数据为清洗后的数据
-                            self.current_data = cleaned_df
+                    # 更新当前数据为清洗后的数据
+                    self.current_data = cleaned_df
 
-                except Exception as e:
-                    print(f"❌ 处理过程中出现错误: {e}")
-                    import traceback
-                    traceback.print_exc()
+        except Exception as e:
+            print(f"❌ 处理过程中出现错误: {e}")
+            import traceback
+            traceback.print_exc()
 
     def run(self):
-        """运行应用程序"""
-        print("选择模式:")
-        print("1. 交互式清洗会话")
-        print("2. 多步骤清洗管道")
-
-        while True:
-            choice = input("请输入选择 (1 或 2): ")
-            if choice in ["1", "2"]:
-                break
-            print("❌ 无效选择，请输入 1 或 2")
-
-        if choice == "1":
-            self.interactive_cleaning_session()
-        elif choice == "2":
-            print("❌ 多步骤管道模式暂不可用，请使用交互式会话")
-            self.interactive_cleaning_session()
+        self.interactive_cleaning_session()
 
 
-# 运行应用程序
 if __name__ == "__main__":
     app = DataCleaningApp()
     app.run()
