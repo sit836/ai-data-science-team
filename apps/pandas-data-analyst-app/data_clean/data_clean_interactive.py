@@ -1,11 +1,27 @@
 import os
-import pandas as pd
+from typing import Dict, List, Any, Optional
+
 import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
+
 from ai_data_science_team import DataCleaningAgent
 
 load_dotenv()
+
+
+class ConversationState(BaseModel):
+    messages: List[Dict[str, str]] = []
+    agreed: bool = False
+    data: pd.DataFrame
+    processing_type: str
+    processing_details: Dict[str, Any]
+    current_response: Optional[str] = None
+    model_config = {
+        "arbitrary_types_allowed": True
+    }
 
 
 class DataCleaningApp:
@@ -20,12 +36,141 @@ class DataCleaningApp:
             model=self.MODEL,
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_API_BASE"),
-            temperature=0.,
-            max_tokens=100
+            temperature=0.7,
+            max_tokens=500
         )
         self.original_df = pd.read_csv("../data/bike_sales_data.csv")
         self.current_data = self.original_df.copy()
-        self.processing_steps = []  # 存储需要执行的处理步骤
+        self.processing_steps = []
+
+    def run_conversation(self, initial_state: ConversationState) -> ConversationState:
+        """运行对话直到用户同意或退出"""
+        state = initial_state
+
+        while not state.agreed:
+            # 显示AI的响应
+            if state.current_response:
+                print(f"\n🤖 {state.current_response}")
+
+            # 获取用户输入
+            while True:
+                user_input = input("\n💬 您有什么疑问吗？如果没有疑问，请输入'继续'开始处理: ")
+                if user_input.strip():
+                    break
+                print("❌ 输入不能为空，请重新输入")
+
+            # 使用语言模型判断用户意图
+            intent = self.classify_user_intent(user_input, state.processing_type)
+
+            if intent == "agree":
+                state.agreed = True
+                break
+            elif intent == "disagree":
+                print("❌ 您不同意当前方案，将取消处理")
+                state.agreed = False
+                break
+
+            # 用户有问题，生成回答
+            state.messages.append({"role": "user", "content": user_input})
+
+            # 根据处理类型构建系统提示
+            if state.processing_type == "missing":
+                system_prompt = """你是一个数据清洗专家，正在帮助用户处理缺失值问题。请友好、专业地回答用户的问题。
+
+    处理方案详情：
+    - 高缺失率列(>50%): 建议删除
+    - 数值列: 建议中位数填充（中位数是将数据排序后位于中间的值，对异常值不敏感）
+    - 分类列: 建议众数填充（众数是出现频率最高的值）
+
+    请用中文回答，保持专业但友好的语气。解释清楚为什么选择这种方法，以及它的优缺点。"""
+            else:  # outlier
+                system_prompt = """你是一个数据清洗专家，正在帮助用户处理异常值问题。请友好、专业地回答用户的问题。
+
+    处理方案详情：
+    - 异常值比例<5%: 建议保留（可能是真实的重要数据）
+    - 异常值比例>20%: 建议对数变换（压缩极端大值，使分布更正态）
+    - 其他情况: 建议缩尾处理（将异常值替换为边界值，保留数据点）
+
+    请用中文回答，保持专业但友好的语气。解释清楚为什么选择这种方法，以及它的优缺点。"""
+
+            # 构建对话上下文
+            conversation_context = "\n".join([
+                f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+                for msg in state.messages[-4:]  # 最近4条消息作为上下文
+            ])
+
+            prompt = f"""{system_prompt}
+
+    当前对话上下文：
+    {conversation_context}
+
+    请生成友好、专业的回答，帮助用户理解处理方案："""
+
+            try:
+                response = self.llm.invoke(prompt)
+                ai_response = response.content
+            except Exception as e:
+                ai_response = "抱歉，我遇到了一些技术问题。中位数填充是将缺失值用该列数据的中位数（排序后的中间值）来填充，这种方法对异常值不敏感，比平均值更稳健。"
+
+            state.messages.append({"role": "assistant", "content": ai_response})
+            state.current_response = ai_response
+
+            # 显示回答后继续循环，而不是直接返回
+            print(f"\n🤖 {ai_response}")
+
+        return state
+
+    def classify_user_intent(self, user_input: str, processing_type: str) -> str:
+        """使用语言模型判断用户意图"""
+        intent_prompt = f"""请分析用户的输入意图，判断用户是否同意当前的数据处理方案。
+
+    用户输入: "{user_input}"
+
+    当前处理类型: {processing_type}
+
+    请从以下选项中选择最匹配的意图：
+    1. agree - 用户明确表示同意、确认或要求继续处理
+    2. disagree - 用户明确表示不同意、拒绝或要求取消处理
+    3. question - 用户提出问题或需要更多解释
+
+    请只返回意图关键词（agree/disagree/question），不要返回其他内容。"""
+
+        try:
+            response = self.llm.invoke(intent_prompt)
+            intent = response.content.strip().lower()
+
+            # 确保返回的是有效的意图
+            if intent in ["agree", "disagree", "question"]:
+                return intent
+            else:
+                # 如果模型返回了其他内容，使用备用逻辑
+                return self.fallback_intent_detection(user_input)
+
+        except Exception as e:
+            print(f"❌ 意图识别失败，使用备用方法: {e}")
+            return self.fallback_intent_detection(user_input)
+
+    def fallback_intent_detection(self, user_input: str) -> str:
+        """备用意图检测方法（当语言模型失败时使用）"""
+        user_input_lower = user_input.lower()
+
+        # 同意意图的关键词
+        agree_keywords = ["继续", "开始", "同意", "好的", "没问题", "ok", "yes", "y", "是", "go", "start", "确认",
+                          "执行", "处理"]
+
+        # 拒绝意图的关键词
+        disagree_keywords = ["不", "不要", "取消", "停止", "退出", "no", "n", "拒绝", "不同意", "算了"]
+
+        # 检查是否包含同意关键词
+        if any(keyword in user_input_lower for keyword in agree_keywords):
+            return "agree"
+
+        # 检查是否包含拒绝关键词
+        if any(keyword in user_input_lower for keyword in disagree_keywords):
+            return "disagree"
+
+        # 默认认为是问题
+        return "question"
 
     class MissingValueHandler:
         """缺失值处理处理器"""
@@ -71,111 +216,56 @@ class DataCleaningApp:
 
             while True:
                 missing_reason = input("🔍 请帮助我了解这些缺失值的原因: ")
-                if missing_reason.strip():  # 确保输入不为空
+                if missing_reason.strip():
                     break
                 print("❌ 输入不能为空，请重新输入")
 
-            # 协商解决方案 - 按数据类型分组处理
-            print("\n💡 基于您的描述，我建议以下处理方案:")
-
-            solutions = []
-
-            # 处理高缺失率列
-            for col in high_missing_cols:
-                solution = f"删除列 '{col}' (缺失值超过50%)"
-                solutions.append((col, solution, "delete_column", "high_missing"))
-
-            # 处理数值列
+            # 构建处理方案
+            suggested_solution_parts = []
+            if high_missing_cols:
+                suggested_solution_parts.append(f"删除列 {high_missing_cols} (缺失值超过50%)")
             if numeric_cols:
-                numeric_solution = f"数值列 {numeric_cols} 使用中位数填充"
-                solutions.append((numeric_cols, numeric_solution, "median_impute", "numeric"))
-
-            # 处理分类列
+                suggested_solution_parts.append(f"数值列 {numeric_cols} 使用中位数填充")
             if categorical_cols:
-                categorical_solution = f"分类列 {categorical_cols} 使用众数填充"
-                solutions.append((categorical_cols, categorical_solution, "mode_impute", "categorical"))
+                suggested_solution_parts.append(f"分类列 {categorical_cols} 使用众数填充")
 
-            # 显示建议方案
-            for i, (cols, solution, _, _) in enumerate(solutions, 1):
-                print(f"{i}. {solution}")
+            suggested_solution = "，".join(suggested_solution_parts) + "。"
+            print(f"\n💡 基于您的描述，我建议以下处理方案:\n{suggested_solution}")
 
-            print(f"{len(solutions) + 1}. 自定义处理方案")
-            print(f"{len(solutions) + 2}. 跳过缺失值处理")
+            # 初始化对话状态
+            initial_state = ConversationState(
+                messages=[
+                    {"role": "assistant", "content": f"我建议的数据处理方案是：{suggested_solution}"}
+                ],
+                agreed=False,
+                data=current_data,
+                processing_type="missing",
+                processing_details={
+                    "high_missing_cols": high_missing_cols,
+                    "numeric_cols": numeric_cols,
+                    "categorical_cols": categorical_cols
+                },
+                current_response=f"我建议的数据处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？我会详细解释每个处理方法的原理和优势。"
+            )
 
-            # 获取用户选择
-            while True:
-                choice = input("\n请选择处理方案（输入数字）: ")
-                try:
-                    choice = int(choice)
-                    if 1 <= choice <= len(solutions) + 2:
-                        break
-                    else:
-                        print(f"❌ 请输入 1 到 {len(solutions) + 2} 之间的数字")
-                except ValueError:
-                    print("❌ 请输入有效的数字")
+            # 运行对话
+            print("\n🔍 您可以询问关于处理方案的任何问题，我会为您详细解释。")
+            final_state = self.app.run_conversation(initial_state)
 
-            if choice == len(solutions) + 1:
-                # 自定义方案
-                while True:
-                    custom_instruction = input("请输入自定义处理指令: ")
-                    if custom_instruction.strip():
-                        break
-                    print("❌ 指令不能为空，请重新输入")
-                result = self.apply_custom_solution(current_data, custom_instruction)
-            elif choice == len(solutions) + 2:
-                # 跳过
-                print("⏭️ 跳过缺失值处理")
-                result = current_data
+            if final_state.agreed:
+                print("\n✅ 开始执行缺失值处理...")
+                result = self.apply_suggested_solution(final_state.data,
+                                                       high_missing_cols,
+                                                       numeric_cols,
+                                                       categorical_cols)
+                return result, True
             else:
-                # 应用选择的方案
-                cols, _, action, col_type = solutions[choice - 1]
-                result = self.apply_solution(current_data, cols, action, col_type)
+                print("⏭️ 用户取消处理，跳过缺失值处理")
+                return current_data, True
 
-            return result, True
-
-        def apply_solution(self, df, columns, action, col_type):
-            """应用特定的缺失值处理方案"""
-            if isinstance(columns, str):
-                columns = [columns]
-
-            if action == "delete_column":
-                for col in columns:
-                    print(f"🗑️ 删除列: {col}")
-                return df.drop(columns=columns)
-            elif action == "median_impute":
-                for col in columns:
-                    median_val = df[col].median()
-                    print(f"🔢 使用中位数填充 {col}: {median_val}")
-                    df[col] = df[col].fillna(median_val)
-                return df
-            elif action == "mode_impute":
-                for col in columns:
-                    mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
-                    print(f"🏷️ 使用众数填充 {col}: {mode_val}")
-                    df[col] = df[col].fillna(mode_val)
-                return df
-            else:
-                return df
-
-        def apply_default_solution(self, df, missing_columns):
-            """应用默认的缺失值处理方案"""
-            print("🔄 应用默认缺失值处理方案")
-
-            # 按数据类型分组处理
-            numeric_cols = []
-            categorical_cols = []
-            high_missing_cols = []
-
-            for col in missing_columns.index:
-                col_type = df[col].dtype
-                missing_percentage = (missing_columns[col] / len(df)) * 100
-
-                if missing_percentage > 50:
-                    high_missing_cols.append(col)
-                elif col_type in ['int64', 'float64']:
-                    numeric_cols.append(col)
-                else:
-                    categorical_cols.append(col)
+        def apply_suggested_solution(self, df, high_missing_cols, numeric_cols, categorical_cols):
+            """应用建议的缺失值处理方案"""
+            print("🔄 应用建议的缺失值处理方案")
 
             # 处理高缺失率列
             if high_missing_cols:
@@ -184,55 +274,20 @@ class DataCleaningApp:
 
             # 处理数值列
             for col in numeric_cols:
-                median_val = df[col].median()
-                print(f"🔢 使用中位数填充 {col}: {median_val}")
-                df[col] = df[col].fillna(median_val)
+                if col in df.columns:
+                    median_val = df[col].median()
+                    print(f"🔢 使用中位数填充 {col}: {median_val}")
+                    df[col] = df[col].fillna(median_val)
 
             # 处理分类列
             for col in categorical_cols:
-                mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
-                print(f"🏷️ 使用众数填充 {col}: {mode_val}")
-                df[col] = df[col].fillna(mode_val)
+                if col in df.columns:
+                    mode_val = df[col].mode()[0] if not df[col].mode().empty else "Unknown"
+                    print(f"🏷️ 使用众数填充 {col}: {mode_val}")
+                    df[col] = df[col].fillna(mode_val)
 
+            print("✅ 缺失值处理完成！")
             return df
-
-        def apply_custom_solution(self, df, instruction):
-            """应用自定义的缺失值处理方案"""
-            print(f"🛠️ 应用自定义方案: {instruction}")
-
-            try:
-                # 创建agent处理自定义指令
-                agent = DataCleaningAgent(
-                    model=self.app.llm,
-                    log=self.app.LOG,
-                    log_path=self.app.LOG_PATH,
-                    human_in_the_loop=False,
-                )
-
-                # 执行清洗
-                config = {"configurable": {"thread_id": "missing_values_custom"}}
-                agent.invoke_agent(
-                    user_instructions=f"处理缺失值: {instruction}",
-                    data_raw=df,
-                    config=config
-                )
-
-                # 获取结果
-                if agent.response and 'data_cleaned' in agent.response:
-                    cleaned_df = pd.DataFrame(agent.response['data_cleaned'])
-                    print("✅ 自定义缺失值处理完成")
-                    return cleaned_df
-                else:
-                    print("❌ 自定义处理失败，使用默认方案")
-                    missing_counts = df.isnull().sum()
-                    missing_columns = missing_counts[missing_counts > 0]
-                    return self.apply_default_solution(df, missing_columns)
-
-            except Exception as e:
-                print(f"❌ 自定义处理错误: {e}")
-                missing_counts = df.isnull().sum()
-                missing_columns = missing_counts[missing_counts > 0]
-                return self.apply_default_solution(df, missing_columns)
 
     class DuplicateHandler:
         """重复值处理处理器"""
@@ -260,309 +315,50 @@ class DataCleaningApp:
             duplicates = current_data[current_data.duplicated(keep=False)]
             print(duplicates.head(5))
 
-            # 协商解决方案
-            print("\n💡 请选择处理重复值的方式:")
-            print("1. 保留第一个出现的重复行，删除后续的")
-            print("2. 自定义处理方案")
+            # 构建处理方案
+            suggested_solution = f"删除所有重复行，保留第一个出现的重复值。这将删除 {duplicate_count} 个重复行。"
+            print(f"\n💡 我建议的处理方案:\n{suggested_solution}")
 
-            while True:
-                choice = input("\n请选择处理方案（输入数字）: ")
-                try:
-                    choice = int(choice)
-                    if 1 <= choice <= 2:
-                        break
-                    else:
-                        print("❌ 请输入 1 到 2 之间的数字")
-                except ValueError:
-                    print("❌ 请输入有效的数字")
+            # 初始化对话状态
+            initial_state = ConversationState(
+                messages=[
+                    {"role": "assistant", "content": f"我建议的重复值处理方案是：{suggested_solution}"}
+                ],
+                agreed=False,
+                data=current_data,
+                processing_type="duplicate",
+                processing_details={
+                    "duplicate_count": duplicate_count,
+                    "suggested_method": "keep_first"
+                },
+                current_response=f"我建议的重复值处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？我会详细解释处理方法的原理和优势。"
+            )
 
-            if choice == 1:
-                result = self.remove_duplicates_keep_first(current_data)
-            elif choice == 2:
-                while True:
-                    custom_instruction = input("请输入自定义处理指令: ")
-                    if custom_instruction.strip():
-                        break
-                    print("❌ 指令不能为空，请重新输入")
-                result = self.apply_custom_solution(current_data, custom_instruction)
+            # 运行对话
+            print("\n🔍 您可以询问关于处理方案的任何问题，我会为您详细解释。")
+            final_state = self.app.run_conversation(initial_state)
 
-            return result, True
+            if final_state.agreed:
+                print("\n✅ 开始执行重复值处理...")
+                result = self.apply_suggested_solution(final_state.data)
+                return result, True
+            else:
+                print("⏭️ 用户取消处理，跳过重复值处理")
+                return current_data, True
 
-        def remove_all_duplicates(self, df):
-            """删除所有完全重复的行"""
-            print("🗑️ 删除所有完全重复的行")
-            initial_count = len(df)
-            df_cleaned = df.drop_duplicates()
-            removed_count = initial_count - len(df_cleaned)
-            print(f"删除了 {removed_count} 个重复行")
-            return df_cleaned
+        def apply_suggested_solution(self, df):
+            """应用建议的重复值处理方案"""
+            print("🔄 应用建议的重复值处理方案")
 
-        def remove_duplicates_by_columns(self, df, columns):
-            """基于指定列删除重复行"""
-            print(f"🗑️ 基于列 {columns} 删除重复行")
-            initial_count = len(df)
-            df_cleaned = df.drop_duplicates(subset=columns)
-            removed_count = initial_count - len(df_cleaned)
-            print(f"删除了 {removed_count} 个重复行")
-            return df_cleaned
-
-        def remove_duplicates_keep_first(self, df):
-            """保留第一个出现的重复行"""
-            print("🗑️ 删除重复行，保留第一个出现的")
             initial_count = len(df)
             df_cleaned = df.drop_duplicates(keep='first')
             removed_count = initial_count - len(df_cleaned)
+
+            print(f"🗑️ 删除重复行，保留第一个出现的")
             print(f"删除了 {removed_count} 个重复行")
+            print("✅ 重复值处理完成！")
+
             return df_cleaned
-
-        def remove_duplicates_keep_last(self, df):
-            """保留最后一个出现的重复行"""
-            print("🗑️ 删除重复行，保留最后一个出现的")
-            initial_count = len(df)
-            df_cleaned = df.drop_duplicates(keep='last')
-            removed_count = initial_count - len(df_cleaned)
-            print(f"删除了 {removed_count} 个重复行")
-            return df_cleaned
-
-        def apply_custom_solution(self, df, instruction):
-            """应用自定义的重复值处理方案"""
-            print(f"🛠️ 应用自定义方案: {instruction}")
-
-            try:
-                agent = DataCleaningAgent(
-                    model=self.app.llm,
-                    log=self.app.LOG,
-                    log_path=self.app.LOG_PATH,
-                    human_in_the_loop=False,
-                )
-
-                config = {"configurable": {"thread_id": "duplicates_custom"}}
-                agent.invoke_agent(
-                    user_instructions=f"处理重复值: {instruction}",
-                    data_raw=df,
-                    config=config
-                )
-
-                if agent.response and 'data_cleaned' in agent.response:
-                    cleaned_df = pd.DataFrame(agent.response['data_cleaned'])
-                    print("✅ 自定义重复值处理完成")
-                    return cleaned_df
-                else:
-                    print("❌ 自定义处理失败，使用默认方案")
-                    return self.remove_all_duplicates(df)
-
-            except Exception as e:
-                print(f"❌ 自定义处理错误: {e}")
-                return self.remove_all_duplicates(df)
-
-    class OutlierHandler:
-        """异常值处理处理器"""
-
-        def __init__(self, app):
-            self.app = app
-
-        def handle_interactive(self, current_data):
-            """处理异常值的交互式流程"""
-            print("\n" + "=" * 60)
-            print("异常值处理向导")
-            print("=" * 60)
-
-            # 检测数值列中的异常值
-            outlier_columns = self.detect_outliers(current_data)
-
-            if len(outlier_columns) == 0:
-                print("✅ 数据中没有检测到明显的异常值！")
-                return current_data, True
-
-            # 打印异常值情况
-            print("检测到异常值的数值列:")
-            for col, info in outlier_columns.items():
-                print(f"  - {col}: {info['count']} 个异常值 ({info['percentage']:.2f}%)")
-                print(f"    正常值范围: [{info['lower_bound']:.2f}, {info['upper_bound']:.2f}]")
-
-            # 询问异常值原因
-            # print("\n🔍 请帮助我了解这些异常值的原因")
-            # print("1. 数据录入错误")
-            # print("2. 测量误差")
-            # print("3. 真实但罕见的极端值")
-            # print("4. 数据处理错误")
-            # print("5. 其他原因")
-
-            while True:
-                outlier_reason = input("🔍 请帮助我了解这些异常值的原因: ")
-                if outlier_reason.strip():
-                    break
-                print("❌ 输入不能为空，请重新输入")
-
-            # 协商解决方案
-            print("\n💡 基于您的描述，我建议以下处理方案:")
-
-            solutions = []
-            for col, info in outlier_columns.items():
-                if info['percentage'] < 5:  # 异常值比例小于5%
-                    solution = f"保留异常值 '{col}' (比例较小，可能是真实数据)"
-                    solutions.append((col, solution, "keep_outliers"))
-                elif info['percentage'] > 20:  # 异常值比例大于20%
-                    solution = f"转换数据 '{col}' (使用对数变换减少异常值影响)"
-                    solutions.append((col, solution, "transform_data"))
-                else:
-                    solution = f"缩尾处理 '{col}' (将异常值替换为边界值)"
-                    solutions.append((col, solution, "winsorize"))
-
-            # 显示建议方案
-            for i, (col, solution, _) in enumerate(solutions, 1):
-                print(f"{i}. {solution}")
-
-            print(f"{len(solutions) + 1}. 自定义处理方案")
-            print(f"{len(solutions) + 2}. 跳过异常值处理")
-
-            # 获取用户选择
-            while True:
-                choice = input("\n请选择处理方案（输入数字）: ")
-                try:
-                    choice = int(choice)
-                    if 1 <= choice <= len(solutions) + 2:
-                        break
-                    else:
-                        print(f"❌ 请输入 1 到 {len(solutions) + 2} 之间的数字")
-                except ValueError:
-                    print("❌ 请输入有效的数字")
-
-            if choice == len(solutions) + 1:
-                # 自定义方案
-                while True:
-                    custom_instruction = input("请输入自定义处理指令: ")
-                    if custom_instruction.strip():
-                        break
-                    print("❌ 指令不能为空，请重新输入")
-                return self.apply_custom_solution(current_data, custom_instruction)
-            elif choice == len(solutions) + 2:
-                # 跳过
-                print("⏭️ 跳过异常值处理")
-                return current_data, True
-            else:
-                # 应用选择的方案
-                col, _, action = solutions[choice - 1]
-                return self.apply_solution(current_data, col, action), True
-
-        def apply_solution(self, df, column, action):
-            """应用特定的异常值处理方案"""
-            if action == "keep_outliers":
-                print(f"✅ 保留列 '{column}' 中的异常值")
-                return df
-            elif action == "transform_data":
-                # 对数变换处理异常值
-                print(f"📊 对列 '{column}' 进行对数变换")
-                if df[column].min() > 0:  # 确保所有值大于0
-                    df[column] = np.log1p(df[column])
-                else:
-                    # 如果有负值，先进行偏移
-                    min_val = df[column].min()
-                    if min_val <= 0:
-                        offset = abs(min_val) + 1
-                        df[column] = np.log1p(df[column] + offset)
-                return df
-            elif action == "winsorize":
-                # 缩尾处理
-                Q1 = df[column].quantile(0.25)
-                Q3 = df[column].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-
-                print(f"🔧 对列 '{column}' 进行缩尾处理，边界值: [{lower_bound:.2f}, {upper_bound:.2f}]")
-
-                df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
-                return df
-            else:
-                return df
-
-        def apply_default_solution(self, df, outlier_columns):
-            """应用默认的异常值处理方案"""
-            print("🔄 应用默认异常值处理方案")
-
-            for col, info in outlier_columns.items():
-                if info['percentage'] < 5:
-                    print(f"✅ 保留列 '{col}' 中的异常值 (比例较小)")
-                elif info['percentage'] > 20:
-                    print(f"📊 对列 '{col}' 进行对数变换 (异常值比例较高)")
-                    if df[col].min() > 0:
-                        df[col] = np.log1p(df[col])
-                    else:
-                        min_val = df[col].min()
-                        if min_val <= 0:
-                            offset = abs(min_val) + 1
-                            df[col] = np.log1p(df[col] + offset)
-                else:
-                    print(f"🔧 对列 '{col}' 进行缩尾处理")
-                    Q1 = df[col].quantile(0.25)
-                    Q3 = df[col].quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - 1.5 * IQR
-                    upper_bound = Q3 + 1.5 * IQR
-                    df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
-
-            return df
-
-        def apply_custom_solution(self, df, instruction):
-            """应用自定义的异常值处理方案"""
-            print(f"🛠️ 应用自定义方案: {instruction}")
-
-            try:
-                # 创建agent处理自定义指令
-                agent = DataCleaningAgent(
-                    model=self.app.llm,
-                    log=self.app.LOG,
-                    log_path=self.app.LOG_PATH,
-                    human_in_the_loop=False,
-                )
-
-                # 执行清洗
-                config = {"configurable": {"thread_id": "outliers_custom"}}
-                agent.invoke_agent(
-                    user_instructions=f"处理异常值: {instruction}",
-                    data_raw=df,
-                    config=config
-                )
-
-                # 获取结果
-                if agent.response and 'data_cleaned' in agent.response:
-                    cleaned_df = pd.DataFrame(agent.response['data_cleaned'])
-                    print("✅ 自定义异常值处理完成")
-                    return cleaned_df
-                else:
-                    print("❌ 自定义处理失败，使用默认方案")
-                    return self.apply_default_solution(df, self.detect_outliers(df))
-
-            except Exception as e:
-                print(f"❌ 自定义处理错误: {e}")
-                return self.apply_default_solution(df, self.detect_outliers(df))
-
-        def detect_outliers(self, df):
-            """检测数据中的异常值"""
-            numeric_columns = df.select_dtypes(include=['int64', 'float64']).columns
-            outlier_columns = {}
-
-            for col in numeric_columns:
-                Q1 = df[col].quantile(0.25)
-                Q3 = df[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-
-                outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
-                outlier_count = len(outliers)
-
-                if outlier_count > 0:
-                    percentage = (outlier_count / len(df)) * 100
-                    outlier_columns[col] = {
-                        'count': outlier_count,
-                        'percentage': percentage,
-                        'lower_bound': lower_bound,
-                        'upper_bound': upper_bound
-                    }
-
-            return outlier_columns
 
     def detect_data_issues(self):
         """检测数据中的所有问题"""
@@ -578,11 +374,6 @@ class DataCleaningApp:
         duplicate_count = self.current_data.duplicated().sum()
         if duplicate_count > 0:
             issues.append(('duplicate', f"发现 {duplicate_count} 个重复行"))
-
-        # 检测异常值
-        outlier_columns = self.detect_outliers(self.current_data)
-        if len(outlier_columns) > 0:
-            issues.append(('outlier', f"发现 {len(outlier_columns)} 列有异常值"))
 
         return issues
 
@@ -612,7 +403,6 @@ class DataCleaningApp:
         # 初始化处理器
         missing_handler = self.MissingValueHandler(self)
         duplicate_handler = self.DuplicateHandler(self)
-        outlier_handler = self.OutlierHandler(self)
 
         while True:
             print("\n" + "=" * 60)
@@ -669,65 +459,18 @@ class DataCleaningApp:
                 elif issue_type == 'duplicate':
                     print("🔍 正在处理重复值问题...")
                     self.current_data, _ = duplicate_handler.handle_interactive(self.current_data)
-                elif issue_type == 'outlier':
-                    print("🔍 正在处理异常值问题...")
-                    self.current_data, _ = outlier_handler.handle_interactive(self.current_data)
 
                 # 显示处理后的数据状态
                 print(f"\n✅ 当前数据形状: {self.current_data.shape}")
 
-                # 询问是否继续处理下一个问题
+                # 自动继续处理下一个问题，不再询问
                 if i < len(issues):
-                    while True:
-                        continue_choice = input(f"\n是否继续处理下一个问题？(y/n): ").lower()
-                        if continue_choice in ['y', 'yes', '是']:
-                            break
-                        elif continue_choice in ['n', 'no', '否']:
-                            print("⏭️ 跳过剩余问题处理")
-                            break
-                        else:
-                            print("❌ 请输入 y/n 或 是/否")
-
-                    if continue_choice in ['n', 'no', '否']:
-                        break
+                    print("⏭️ 自动继续处理下一个问题...")
 
             # 所有问题处理完成后，提供额外选项
             print(f"\n{'=' * 60}")
             print("所有检测到的问题已处理完成！")
             print(f"{'=' * 60}")
-
-            while True:
-                print("\n请选择下一步操作:")
-                print("1. 重新检测数据问题")
-                print("2. 执行自定义清洗指令")
-                print("3. 保存当前数据")
-                print("4. 重置数据到原始状态")
-                print("5. 退出程序")
-
-                choice = input("\n请输入选项数字: ")
-
-                if choice == '1':
-                    break  # 重新开始循环，再次检测问题
-                elif choice == '2':
-                    while True:
-                        user_instructions = input("请输入自定义清洗指令: ")
-                        if user_instructions.strip():
-                            break
-                        print("❌ 指令不能为空，请重新输入")
-                    self.execute_custom_cleaning(user_instructions, config)
-                elif choice == '3':
-                    output_path = input("请输入保存路径（默认: cleaned_data.csv）: ") or "cleaned_data.csv"
-                    self.current_data.to_csv(output_path, index=False)
-                    print(f"✅ 数据已保存到 {output_path}")
-                elif choice == '4':
-                    self.current_data = self.original_df.copy()
-                    print("✅ 数据已重置为原始数据")
-                    break  # 重新检测问题
-                elif choice == '5':
-                    print("👋 感谢使用数据清洗工具，再见！")
-                    return
-                else:
-                    print("❌ 请输入有效的选项（1-5）")
 
     def execute_custom_cleaning(self, user_instructions, config):
         """执行自定义清洗指令"""
