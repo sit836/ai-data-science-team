@@ -1,7 +1,6 @@
 import os
 from typing import Dict, List, Any, Optional
 
-import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -417,32 +416,7 @@ class DataCleaningApp:
             issues = self.run_data_diagnosis()
 
             if not issues:
-                # 如果没有发现问题，询问用户下一步操作
                 print("\n✅ 数据质量良好，未发现明显问题！")
-                print("\n您可以选择:")
-                print("1. 执行自定义清洗指令")
-                print("2. 重置数据到原始状态")
-                print("3. 退出程序")
-
-                while True:
-                    choice = input("\n请选择下一步操作（输入数字）: ")
-                    if choice == '1':
-                        while True:
-                            user_instructions = input("请输入自定义清洗指令: ")
-                            if user_instructions.strip():
-                                break
-                            print("❌ 指令不能为空，请重新输入")
-                        self.execute_custom_cleaning(user_instructions, config)
-                        break
-                    elif choice == '2':
-                        self.current_data = self.original_df.copy()
-                        print("✅ 数据已重置为原始数据")
-                        break
-                    elif choice == '3':
-                        print("👋 感谢使用数据清洗工具，再见！")
-                        return
-                    else:
-                        print("❌ 请输入有效的选项（1-3）")
                 continue
 
             # 引导用户依次处理每个问题
