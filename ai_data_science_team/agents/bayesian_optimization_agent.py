@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from IPython.display import Markdown
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, AIMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langgraph.graph import START, END, StateGraph
 from langgraph.prebuilt import create_react_agent, ToolNode
 from langgraph.prebuilt.chat_agent_executor import AgentState
@@ -235,6 +235,10 @@ def make_bayesian_optimization_agent(
         optimizer_state: dict
         current_suggestion: list
         confirmed_parameters: bool
+        optimization_goal: str
+        input_variables: list
+        output_variable: str
+        variable_bounds: dict
 
     def bayesian_optimization_agent(state):
         print(format_agent_name(AGENT_NAME))
@@ -245,21 +249,126 @@ def make_bayesian_optimization_agent(
         # 定义工具
         def identify_parameters(data_info: str, objective: str):
             """识别优化参数和目标"""
-            # 这里应该包含与用户交互的逻辑
-            return {"status": "parameters_identified"}
+            # 与用户交互确定优化目标
+            print("Please specify your optimization goal (maximize/minimize):")
+            goal = input().strip().lower()
+            while goal not in ["maximize", "minimize"]:
+                print("Please enter either 'maximize' or 'minimize':")
+                goal = input().strip().lower()
+
+            # 与用户交互确定输入变量
+            print("Please enter the names of input variables (comma-separated):")
+            input_vars = [v.strip() for v in input().split(",")]
+
+            # 与用户交互确定输出变量
+            print("Please enter the name of the output variable:")
+            output_var = input().strip()
+
+            # 与用户交互确定变量范围
+            bounds = {}
+            for var in input_vars:
+                print(f"Please enter the range for {var} (min,max):")
+                min_val, max_val = map(float, input().split(","))
+                bounds[var] = (min_val, max_val)
+
+            return {
+                "status": "parameters_identified",
+                "optimization_goal": goal,
+                "input_variables": input_vars,
+                "output_variable": output_var,
+                "variable_bounds": bounds
+            }
 
         def suggest_next_parameters(optimizer_state: dict):
             """建议下一组参数"""
-            # 贝叶斯优化逻辑
-            return {"suggestion": [0.1, 0.5, 10]}
+            # 从状态中获取边界信息
+            bounds_list = []
+            input_vars = state.get("input_variables", [])
+            variable_bounds = state.get("variable_bounds", {})
+
+            for var in input_vars:
+                if var in variable_bounds:
+                    bounds_list.append(variable_bounds[var])
+
+            # 创建或恢复优化器
+            if not state.get("optimizer_state") or not state["optimizer_state"].get("bounds"):
+                optimizer = BayesianOptimizer(bounds_list)
+            else:
+                optimizer = BayesianOptimizer(bounds_list)
+                optimizer.__dict__.update(state["optimizer_state"])
+
+            # 获取建议
+            suggestion = optimizer.suggest_next_point()
+
+            # 格式化建议以便用户理解
+            formatted_suggestion = {}
+            for i, var in enumerate(input_vars):
+                formatted_suggestion[var] = suggestion[i]
+
+            # 保存优化器状态
+            state["optimizer_state"] = optimizer.__dict__
+            state["current_suggestion"] = suggestion
+
+            return {"suggestion": formatted_suggestion}
 
         def confirm_parameters(parameters: list):
             """确认参数设置"""
-            return {"confirmed": True}
+            print("The suggested parameters are:")
+            for var, value in parameters.items():
+                print(f"{var}: {value}")
+
+            print("Do you want to use these parameters? (yes/no)")
+            response = input().strip().lower()
+
+            if response in ["yes", "y"]:
+                return {"confirmed": True}
+            else:
+                print("Please provide your preferred parameter values:")
+                custom_params = {}
+                for var in parameters.keys():
+                    print(f"{var}:")
+                    value = float(input().strip())
+                    custom_params[var] = value
+
+                state["current_suggestion"] = [custom_params[var] for var in state.get("input_variables", [])]
+                return {"confirmed": True, "custom_parameters": custom_params}
 
         def update_optimization_result(parameters: list, result: float):
             """更新优化结果"""
-            return {"status": "updated"}
+            # 获取当前优化器状态或创建新优化器
+            bounds_list = []
+            input_vars = state.get("input_variables", [])
+            variable_bounds = state.get("variable_bounds", {})
+
+            for var in input_vars:
+                if var in variable_bounds:
+                    bounds_list.append(variable_bounds[var])
+
+            if not state.get("optimizer_state") or not state["optimizer_state"].get("bounds"):
+                optimizer = BayesianOptimizer(bounds_list)
+            else:
+                optimizer = BayesianOptimizer(bounds_list)
+                optimizer.__dict__.update(state["optimizer_state"])
+
+            # 更新优化器
+            optimizer.update(parameters, result)
+
+            # 保存优化器状态
+            state["optimizer_state"] = optimizer.__dict__
+
+            # 更新优化结果
+            if "optimization_results" not in state:
+                state["optimization_results"] = []
+
+            result_entry = {
+                "parameters": dict(zip(input_vars, parameters)),
+                "result": result
+            }
+            state["optimization_results"].append(result_entry)
+
+            return {"status": "updated",
+                    "best_result": max(optimizer.y) if state.get("optimization_goal") == "maximize" else min(
+                        optimizer.y)}
 
         tools = [
             identify_parameters,
@@ -284,6 +393,10 @@ def make_bayesian_optimization_agent(
                 "optimizer_state": state.get("optimizer_state", {}),
                 "current_suggestion": state.get("current_suggestion", []),
                 "confirmed_parameters": state.get("confirmed_parameters", False),
+                "optimization_goal": state.get("optimization_goal", ""),
+                "input_variables": state.get("input_variables", []),
+                "output_variable": state.get("output_variable", ""),
+                "variable_bounds": state.get("variable_bounds", {}),
             },
             invoke_react_agent_kwargs,
         )
@@ -296,7 +409,7 @@ def make_bayesian_optimization_agent(
         last_ai_message = AIMessage(internal_messages[-1].content, role=AGENT_NAME)
 
         # 提取优化结果
-        optimization_results = {}
+        optimization_results = response.get("optimization_results", {})
         tool_calls = get_tool_call_names(internal_messages)
 
         return {
@@ -307,6 +420,10 @@ def make_bayesian_optimization_agent(
             "optimizer_state": response.get("optimizer_state", {}),
             "current_suggestion": response.get("current_suggestion", []),
             "confirmed_parameters": response.get("confirmed_parameters", False),
+            "optimization_goal": response.get("optimization_goal", ""),
+            "input_variables": response.get("input_variables", []),
+            "output_variable": response.get("output_variable", ""),
+            "variable_bounds": response.get("variable_bounds", {}),
         }
 
     workflow = StateGraph(GraphState)
@@ -335,7 +452,7 @@ if __name__ == '__main__':
                      temperature=0., max_tokens=100)
     agent_executor = make_bayesian_optimization_agent(llm)
 
-    test_query = "I have input parameters [[1,2,3],[2,3,1],[3,1,2],[4,5,6],[5,6,4]] and target values [10,15,12,25,30]. Can you get recommendations to maximize target"
+    test_query = "I want to optimize a process with parameters temperature, pressure, and time. The output is yield."
 
     result = agent_executor.invoke({"user_instructions": test_query})
     print("Agent test results:", result)
