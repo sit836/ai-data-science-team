@@ -1,7 +1,10 @@
 import os
 from typing import Dict, List, Any, Optional
+import re
+import time
 
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
@@ -18,6 +21,8 @@ class ConversationState(BaseModel):
     processing_type: str
     processing_details: Dict[str, Any]
     current_response: Optional[str] = None
+    custom_solution_proposed: bool = False
+    custom_solution: Optional[str] = None
     model_config = {
         "arbitrary_types_allowed": True
     }
@@ -36,7 +41,8 @@ class DataCleaningApp:
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_API_BASE"),
             temperature=0.7,
-            max_tokens=500
+            max_tokens=500,
+            timeout=10  # 较短的超时时间
         )
         self.original_df = pd.read_csv("../data/bike_sales_data.csv")
         self.current_data = self.original_df.copy()
@@ -58,8 +64,8 @@ class DataCleaningApp:
                     break
                 print("❌ 输入不能为空，请重新输入")
 
-            # 使用语言模型判断用户意图
-            intent = self.classify_user_intent(user_input, state.processing_type)
+            # 使用LLM判断用户意图（带重试和降级处理）
+            intent, custom_solution = self.llm_intent_detection_with_fallback(user_input, state.processing_type)
 
             if intent == "agree":
                 state.agreed = True
@@ -68,109 +74,246 @@ class DataCleaningApp:
                 print("❌ 您不同意当前方案，将取消处理")
                 state.agreed = False
                 break
+            elif intent == "custom_solution":
+                # 用户提出了自定义方案
+                state.custom_solution_proposed = True
+                state.custom_solution = custom_solution or user_input
 
-            # 用户有问题，生成回答
+                # 使用LLM评估自定义方案的合理性
+                is_reasonable, feedback = self.llm_evaluate_solution_with_fallback(
+                    state.custom_solution, state.processing_type, state.processing_details
+                )
+
+                if is_reasonable:
+                    print(f"\n✅ {feedback}")
+                    confirmation = input("是否确认执行此方案？(yes/no): ").lower().strip()
+                    if confirmation in ['yes', 'y', '是', '确认']:
+                        state.agreed = True
+                        break
+                    else:
+                        print("请重新考虑您的方案或提出新的方案")
+                        state.current_response = "您的方案看起来合理，但您选择了不执行。请提出新的方案或继续讨论原方案。"
+                else:
+                    # 即使方案不合理，也询问用户是否坚持
+                    print(f"\n⚠️ {feedback}")
+                    confirmation = input("您仍然确定要执行此方案吗？(yes/no): ").lower().strip()
+                    if confirmation in ['yes', 'y', '是', '确认']:
+                        print("✅ 尊重您的选择，将执行您的方案")
+                        state.agreed = True
+                        break
+                    else:
+                        print("请修改您的方案或继续讨论原方案")
+                        state.current_response = f"关于您的方案: {feedback}\n请考虑修改或继续讨论原方案。"
+
+                continue
+
+            # 用户有问题，使用LLM生成回答
             state.messages.append({"role": "user", "content": user_input})
 
-            # 根据处理类型构建系统提示
-            if state.processing_type == "missing":
-                system_prompt = """你是一个数据清洗专家，正在帮助用户处理缺失值问题。请友好、专业地回答用户的问题。
-
-    处理方案详情：
-    - 高缺失率列(>50%): 建议删除
-    - 数值列: 建议中位数填充（中位数是将数据排序后位于中间的值，对异常值不敏感）
-    - 分类列: 建议众数填充（众数是出现频率最高的值）
-
-    请用中文回答，保持专业但友好的语气。解释清楚为什么选择这种方法，以及它的优缺点。"""
-            else:  # outlier
-                system_prompt = """你是一个数据清洗专家，正在帮助用户处理异常值问题。请友好、专业地回答用户的问题。
-
-    处理方案详情：
-    - 异常值比例<5%: 建议保留（可能是真实的重要数据）
-    - 异常值比例>20%: 建议对数变换（压缩极端大值，使分布更正态）
-    - 其他情况: 建议缩尾处理（将异常值替换为边界值，保留数据点）
-
-    请用中文回答，保持专业但友好的语气。解释清楚为什么选择这种方法，以及它的优缺点。"""
-
-            # 构建对话上下文
-            conversation_context = "\n".join([
-                f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
-                for msg in state.messages[-4:]  # 最近4条消息作为上下文
-            ])
-
-            prompt = f"""{system_prompt}
-
-    当前对话上下文：
-    {conversation_context}
-
-    请生成友好、专业的回答，帮助用户理解处理方案："""
-
-            try:
-                response = self.llm.invoke(prompt)
-                ai_response = response.content
-            except Exception as e:
-                ai_response = "抱歉，我遇到了一些技术问题。中位数填充是将缺失值用该列数据的中位数（排序后的中间值）来填充，这种方法对异常值不敏感，比平均值更稳健。"
+            ai_response = self.llm_generate_response_with_fallback(
+                user_input, state.processing_type, state.messages, state.processing_details
+            )
 
             state.messages.append({"role": "assistant", "content": ai_response})
             state.current_response = ai_response
 
-            # 显示回答后继续循环，而不是直接返回
-            print(f"\n🤖 {ai_response}")
-
         return state
 
-    def classify_user_intent(self, user_input: str, processing_type: str) -> str:
-        """使用语言模型判断用户意图"""
-        intent_prompt = f"""请分析用户的输入意图，判断用户是否同意当前的数据处理方案。
+    def llm_intent_detection_with_fallback(self, user_input: str, processing_type: str, max_retries: int = 2) -> tuple:
+        """使用LLM判断用户意图，带重试和降级处理"""
+        for attempt in range(max_retries):
+            try:
+                intent, custom_solution = self.llm_classify_intent(user_input, processing_type)
+                return intent, custom_solution
+            except Exception as e:
+                print(f"❌ 意图识别尝试 {attempt + 1} 失败: {e}")
+                time.sleep(1)  # 短暂等待后重试
 
-    用户输入: "{user_input}"
+        # 所有重试都失败，使用降级逻辑
+        print("⚠️ LLM不可用，使用备用意图检测")
+        return self.fallback_intent_detection(user_input), user_input
 
-    当前处理类型: {processing_type}
+    def llm_classify_intent(self, user_input: str, processing_type: str) -> tuple:
+        """使用LLM判断用户意图"""
+        intent_prompt = f"""作为数据清洗助手，请分析用户的输入意图。
 
-    请从以下选项中选择最匹配的意图：
-    1. agree - 用户明确表示同意、确认或要求继续处理
-    2. disagree - 用户明确表示不同意、拒绝或要求取消处理
-    3. question - 用户提出问题或需要更多解释
+用户输入: "{user_input}"
+当前处理类型: {processing_type}
 
-    请只返回意图关键词（agree/disagree/question），不要返回其他内容。"""
+请判断用户的意图：
+1. agree - 用户同意当前方案，要求继续处理
+2. disagree - 用户不同意当前方案，要求取消处理  
+3. question - 用户提出问题或需要解释
+4. custom_solution - 用户提出了自定义的处理方案
+
+如果是自定义方案，请提取方案的核心内容。
+
+请返回格式：意图|方案内容（如适用）
+
+示例：
+agree|
+question|
+custom_solution|使用平均值填充缺失值"""
 
         try:
             response = self.llm.invoke(intent_prompt)
-            intent = response.content.strip().lower()
+            result = response.content.strip()
 
-            # 确保返回的是有效的意图
-            if intent in ["agree", "disagree", "question"]:
-                return intent
-            else:
-                # 如果模型返回了其他内容，使用备用逻辑
-                return self.fallback_intent_detection(user_input)
+            if "|" in result:
+                intent, custom_solution = result.split("|", 1)
+                intent = intent.strip().lower()
+                custom_solution = custom_solution.strip()
+
+                # 验证意图是否有效
+                valid_intents = ["agree", "disagree", "question", "custom_solution"]
+                if intent in valid_intents:
+                    return intent, custom_solution
+
+            # 如果格式不正确，抛出异常触发重试
+            raise ValueError("LLM返回格式不正确")
 
         except Exception as e:
-            print(f"❌ 意图识别失败，使用备用方法: {e}")
-            return self.fallback_intent_detection(user_input)
+            print(f"❌ LLM意图识别错误: {e}")
+            raise
+
+    def llm_evaluate_solution_with_fallback(self, custom_solution: str, processing_type: str, processing_details: Dict,
+                                            max_retries: int = 2) -> tuple:
+        """使用LLM评估方案合理性，带重试"""
+        for attempt in range(max_retries):
+            try:
+                return self.llm_evaluate_solution(custom_solution, processing_type, processing_details)
+            except Exception as e:
+                print(f"❌ 方案评估尝试 {attempt + 1} 失败: {e}")
+                time.sleep(1)
+
+        # 评估失败时的降级处理
+        print("⚠️ LLM评估不可用，使用默认评估")
+        return True, "无法进行评估，将尊重您的选择执行方案"
+
+    def llm_evaluate_solution(self, custom_solution: str, processing_type: str, processing_details: Dict) -> tuple:
+        """使用LLM评估自定义方案的合理性"""
+        evaluation_prompt = f"""作为数据清洗专家，请评估用户提出的处理方案。
+
+处理类型: {processing_type}
+处理详情: {processing_details}
+用户方案: "{custom_solution}"
+
+请评估：
+1. 方案的技术合理性（是否符合数据清洗最佳实践）
+2. 潜在的风险或问题
+3. 改进建议（如有）
+
+请用友好、专业的态度回复，返回格式：合理与否(true/false)|评估反馈"""
+
+        try:
+            response = self.llm.invoke(evaluation_prompt)
+            result = response.content.strip()
+
+            if "|" in result:
+                is_reasonable_str, feedback = result.split("|", 1)
+                is_reasonable = is_reasonable_str.strip().lower() == "true"
+                return is_reasonable, feedback.strip()
+
+            raise ValueError("LLM评估返回格式不正确")
+
+        except Exception as e:
+            print(f"❌ LLM方案评估错误: {e}")
+            raise
+
+    def llm_generate_response_with_fallback(self, user_input: str, processing_type: str, messages: List[Dict],
+                                            processing_details: Dict, max_retries: int = 2) -> str:
+        """使用LLM生成回答，带重试"""
+        for attempt in range(max_retries):
+            try:
+                return self.llm_generate_response(user_input, processing_type, messages, processing_details)
+            except Exception as e:
+                print(f"❌ 回答生成尝试 {attempt + 1} 失败: {e}")
+                time.sleep(1)
+
+        # 生成回答失败时的降级处理
+        return self.get_fallback_response(processing_type, user_input, processing_details)
+
+    def llm_generate_response(self, user_input: str, processing_type: str, messages: List[Dict],
+                              processing_details: Dict) -> str:
+        """使用LLM生成专业回答"""
+        # 构建对话上下文
+        conversation_context = "\n".join([
+            f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+            for msg in messages[-3:]  # 最近3条消息
+        ])
+
+        system_prompt = self.get_system_prompt(processing_type, processing_details)
+
+        prompt = f"""{system_prompt}
+
+当前对话上下文：
+{conversation_context}
+
+用户最新问题: "{user_input}"
+
+请生成友好、专业的回答，帮助用户理解处理方案："""
+
+        try:
+            response = self.llm.invoke(prompt)
+            return response.content
+        except Exception as e:
+            print(f"❌ LLM回答生成错误: {e}")
+            raise
+
+    def get_system_prompt(self, processing_type: str, processing_details: Dict) -> str:
+        """获取系统提示"""
+        prompts = {
+            "missing": f"""你是一个数据清洗专家，正在帮助用户处理缺失值问题。
+
+当前缺失值情况：
+{processing_details}
+
+请用中文友好、专业地回答用户的问题，解释清楚处理方法的原理和优势。""",
+
+            "duplicate": f"""你是一个数据清洗专家，正在帮助用户处理重复值问题。
+
+当前重复值情况：
+{processing_details}
+
+请用中文友好、专业地回答用户的问题。""",
+
+            "outlier": f"""你是一个数据清洗专家，正在帮助用户处理异常值问题。
+
+当前异常值情况：
+{processing_details}
+
+请用中文友好、专业地回答用户的问题。"""
+        }
+        return prompts.get(processing_type, "你是一个数据清洗专家，请用中文友好、专业地回答用户的问题。")
 
     def fallback_intent_detection(self, user_input: str) -> str:
-        """备用意图检测方法（当语言模型失败时使用）"""
-        user_input_lower = user_input.lower()
+        """备用意图检测方法"""
+        user_input_lower = user_input.lower().strip()
 
-        # 同意意图的关键词
-        agree_keywords = ["继续", "开始", "同意", "好的", "没问题", "ok", "yes", "y", "是", "go", "start", "确认",
-                          "执行", "处理"]
+        # 简单的关键词匹配（仅在LLM不可用时使用）
+        agree_keywords = ['继续', '开始', '同意', '好的', '没问题', 'ok', 'yes', 'y', '是']
+        disagree_keywords = ['不', '不要', '取消', '停止', '退出', 'no', 'n', '拒绝', '不同意']
+        custom_keywords = ['用', '填充', '删除', '保留', '处理', '方案']
 
-        # 拒绝意图的关键词
-        disagree_keywords = ["不", "不要", "取消", "停止", "退出", "no", "n", "拒绝", "不同意", "算了"]
-
-        # 检查是否包含同意关键词
         if any(keyword in user_input_lower for keyword in agree_keywords):
             return "agree"
-
-        # 检查是否包含拒绝关键词
-        if any(keyword in user_input_lower for keyword in disagree_keywords):
+        elif any(keyword in user_input_lower for keyword in disagree_keywords):
             return "disagree"
+        elif any(keyword in user_input_lower for keyword in custom_keywords):
+            return "custom_solution"
+        else:
+            return "question"
 
-        # 默认认为是问题
-        return "question"
+    def get_fallback_response(self, processing_type: str, user_input: str, processing_details: Dict) -> str:
+        """获取备用回答"""
+        responses = {
+            "missing": f"关于您的输入'{user_input}'，在缺失值处理中，我们通常根据数据类型和缺失比例选择不同的填充方法。",
+            "duplicate": f"关于您的输入'{user_input}'，在重复值处理中，我们建议删除完全重复的行。",
+            "outlier": f"关于您的输入'{user_input}'，在异常值处理中，需要根据异常值的比例选择不同的处理方法。"
+        }
+        return responses.get(processing_type, f"关于您的输入'{user_input}'，我会尽力帮助您。")
 
+    # MissingValueHandler 类（使用LLM进行意图判断）
     class MissingValueHandler:
         """缺失值处理处理器"""
 
@@ -213,12 +356,6 @@ class DataCleaningApp:
                 else:
                     categorical_cols.append(col)
 
-            while True:
-                missing_reason = input("🔍 请帮助我了解这些缺失值的原因: ")
-                if missing_reason.strip():
-                    break
-                print("❌ 输入不能为空，请重新输入")
-
             # 构建处理方案
             suggested_solution_parts = []
             if high_missing_cols:
@@ -229,38 +366,79 @@ class DataCleaningApp:
                 suggested_solution_parts.append(f"分类列 {categorical_cols} 使用众数填充")
 
             suggested_solution = "，".join(suggested_solution_parts) + "。"
-            print(f"\n💡 基于您的描述，我建议以下处理方案:\n{suggested_solution}")
+            print(f"\n💡 基于分析，我建议以下处理方案:\n{suggested_solution}")
 
             # 初始化对话状态
             initial_state = ConversationState(
-                messages=[
-                    {"role": "assistant", "content": f"我建议的数据处理方案是：{suggested_solution}"}
-                ],
+                messages=[],
                 agreed=False,
                 data=current_data,
                 processing_type="missing",
                 processing_details={
                     "high_missing_cols": high_missing_cols,
                     "numeric_cols": numeric_cols,
-                    "categorical_cols": categorical_cols
+                    "categorical_cols": categorical_cols,
+                    "suggested_solution": suggested_solution
                 },
-                current_response=f"我建议的数据处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？我会详细解释每个处理方法的原理和优势。"
+                current_response=f"建议的数据处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
             )
 
             # 运行对话
-            print("\n🔍 您可以询问关于处理方案的任何问题，我会为您详细解释。")
             final_state = self.app.run_conversation(initial_state)
 
             if final_state.agreed:
-                print("\n✅ 开始执行缺失值处理...")
-                result = self.apply_suggested_solution(final_state.data,
-                                                       high_missing_cols,
-                                                       numeric_cols,
-                                                       categorical_cols)
+                if final_state.custom_solution_proposed and final_state.custom_solution:
+                    print(f"\n✅ 开始执行您的自定义方案: {final_state.custom_solution}")
+                    result = self.apply_custom_solution(final_state.data, final_state.custom_solution,
+                                                        final_state.processing_details)
+                else:
+                    print("\n✅ 开始执行建议的缺失值处理...")
+                    result = self.apply_suggested_solution(final_state.data,
+                                                           high_missing_cols,
+                                                           numeric_cols,
+                                                           categorical_cols)
                 return result, True
             else:
                 print("⏭️ 用户取消处理，跳过缺失值处理")
                 return current_data, True
+
+        def apply_custom_solution(self, df, custom_solution, processing_details):
+            """应用用户自定义的缺失值处理方案"""
+            print(f"🔄 应用自定义方案: {custom_solution}")
+
+            # 使用LLM解析和执行自定义方案
+            try:
+                execution_prompt = f"""请解析并执行以下缺失值处理方案：
+
+数据集信息:
+- 形状: {df.shape}
+- 列名: {list(df.columns)}
+- 缺失列详情: {processing_details}
+
+自定义方案: "{custom_solution}"
+
+请生成Python代码来执行这个方案，只返回代码部分："""
+
+                response = self.app.llm.invoke(execution_prompt)
+                code = response.content.strip()
+
+                # 安全地执行代码
+                local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
+                exec(code, {}, local_vars)
+
+                result_df = local_vars['df']
+                print("✅ 自定义方案执行成功！")
+                return result_df
+
+            except Exception as e:
+                print(f"❌ 自定义方案执行失败: {e}")
+                print("⚠️ 使用建议方案代替")
+                return self.apply_suggested_solution(
+                    df,
+                    processing_details['high_missing_cols'],
+                    processing_details['numeric_cols'],
+                    processing_details['categorical_cols']
+                )
 
         def apply_suggested_solution(self, df, high_missing_cols, numeric_cols, categorical_cols):
             """应用建议的缺失值处理方案"""
@@ -312,7 +490,7 @@ class DataCleaningApp:
             # 显示重复行示例
             print("\n重复行示例:")
             duplicates = current_data[current_data.duplicated(keep=False)]
-            print(duplicates.head(5))
+            print(duplicates.head(3).to_string())
 
             # 构建处理方案
             suggested_solution = f"删除所有重复行，保留第一个出现的重复值。这将删除 {duplicate_count} 个重复行。"
@@ -320,30 +498,67 @@ class DataCleaningApp:
 
             # 初始化对话状态
             initial_state = ConversationState(
-                messages=[
-                    {"role": "assistant", "content": f"我建议的重复值处理方案是：{suggested_solution}"}
-                ],
+                messages=[],
                 agreed=False,
                 data=current_data,
                 processing_type="duplicate",
                 processing_details={
                     "duplicate_count": duplicate_count,
-                    "suggested_method": "keep_first"
+                    "duplicate_sample": duplicates.head(3).to_dict(),
+                    "suggested_solution": suggested_solution
                 },
-                current_response=f"我建议的重复值处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？我会详细解释处理方法的原理和优势。"
+                current_response=f"建议的重复值处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
             )
 
             # 运行对话
-            print("\n🔍 您可以询问关于处理方案的任何问题，我会为您详细解释。")
             final_state = self.app.run_conversation(initial_state)
 
             if final_state.agreed:
-                print("\n✅ 开始执行重复值处理...")
-                result = self.apply_suggested_solution(final_state.data)
+                if final_state.custom_solution_proposed and final_state.custom_solution:
+                    print(f"\n✅ 开始执行您的自定义方案: {final_state.custom_solution}")
+                    result = self.apply_custom_solution(final_state.data, final_state.custom_solution,
+                                                        final_state.processing_details)
+                else:
+                    print("\n✅ 开始执行重复值处理...")
+                    result = self.apply_suggested_solution(final_state.data)
                 return result, True
             else:
                 print("⏭️ 用户取消处理，跳过重复值处理")
                 return current_data, True
+
+        def apply_custom_solution(self, df, custom_solution, processing_details):
+            """应用用户自定义的重复值处理方案"""
+            print(f"🔄 应用自定义方案: {custom_solution}")
+
+            # 使用LLM解析和执行自定义方案
+            try:
+                execution_prompt = f"""请解析并执行以下重复值处理方案：
+
+数据集信息:
+- 形状: {df.shape}
+- 列名: {list(df.columns)}
+- 重复行数: {processing_details['duplicate_count']}
+
+自定义方案: "{custom_solution}"
+
+请生成Python代码来执行这个方案，只返回代码部分："""
+
+                response = self.app.llm.invoke(execution_prompt)
+                code = response.content.strip()
+
+                # 安全地执行代码
+                local_vars = {'df': df.copy(), 'pd': pd}
+                exec(code, {}, local_vars)
+
+                result_df = local_vars['df']
+                removed_count = len(df) - len(result_df)
+                print(f"✅ 自定义方案执行成功！删除了 {removed_count} 个重复行")
+                return result_df
+
+            except Exception as e:
+                print(f"❌ 自定义方案执行失败: {e}")
+                print("⚠️ 使用建议方案代替")
+                return self.apply_suggested_solution(df)
 
         def apply_suggested_solution(self, df):
             """应用建议的重复值处理方案"""
@@ -359,6 +574,167 @@ class DataCleaningApp:
 
             return df_cleaned
 
+    class OutlierHandler:
+        """异常值处理处理器"""
+
+        def __init__(self, app):
+            self.app = app
+
+        def handle_interactive(self, current_data):
+            """处理异常值的交互式流程"""
+            print("\n" + "=" * 60)
+            print("异常值处理向导")
+            print("=" * 60)
+
+            # 检查数值列
+            numeric_cols = current_data.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+            if not numeric_cols:
+                print("✅ 数据中没有数值列，无需处理异常值！")
+                return current_data, True
+
+            print(f"发现 {len(numeric_cols)} 个数值列: {numeric_cols}")
+
+            # 显示数值列的基本统计信息
+            print("\n数值列统计信息:")
+            for col in numeric_cols[:3]:  # 只显示前3列
+                col_data = current_data[col].dropna()
+                if len(col_data) > 0:
+                    print(
+                        f"  - {col}: 均值={col_data.mean():.2f}, 标准差={col_data.std():.2f}, 范围=[{col_data.min():.2f}, {col_data.max():.2f}]")
+
+            # 检测异常值
+            outlier_info = self.detect_outliers(current_data, numeric_cols)
+
+            # 构建处理方案
+            suggested_solution = f"对所有数值列进行异常值检测，根据异常值比例采用不同的处理策略：比例<5%保留，>20%对数变换，其他情况缩尾处理。"
+            print(f"\n💡 我建议的处理方案:\n{suggested_solution}")
+
+            # 初始化对话状态
+            initial_state = ConversationState(
+                messages=[],
+                agreed=False,
+                data=current_data,
+                processing_type="outlier",
+                processing_details={
+                    "numeric_cols": numeric_cols,
+                    "outlier_info": outlier_info,
+                    "suggested_solution": suggested_solution
+                },
+                current_response=f"建议的异常值处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
+            )
+
+            # 运行对话
+            final_state = self.app.run_conversation(initial_state)
+
+            if final_state.agreed:
+                if final_state.custom_solution_proposed and final_state.custom_solution:
+                    print(f"\n✅ 开始执行您的自定义方案: {final_state.custom_solution}")
+                    result = self.apply_custom_solution(final_state.data, final_state.custom_solution,
+                                                        final_state.processing_details)
+                else:
+                    print("\n✅ 开始执行异常值处理...")
+                    result = self.apply_suggested_solution(final_state.data, numeric_cols)
+                return result, True
+            else:
+                print("⏭️ 用户取消处理，跳过异常值处理")
+                return current_data, True
+
+        def detect_outliers(self, df, numeric_cols):
+            """检测异常值"""
+            outlier_info = {}
+            for col in numeric_cols:
+                if col in df.columns:
+                    col_data = df[col].dropna()
+                    if len(col_data) > 0:
+                        Q1 = col_data.quantile(0.25)
+                        Q3 = col_data.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+
+                        outliers = ((df[col] < lower_bound) | (df[col] > upper_bound)).sum()
+                        outlier_ratio = outliers / len(df) if len(df) > 0 else 0
+
+                        outlier_info[col] = {
+                            'outliers': outliers,
+                            'outlier_ratio': outlier_ratio,
+                            'lower_bound': lower_bound,
+                            'upper_bound': upper_bound
+                        }
+            return outlier_info
+
+        def apply_custom_solution(self, df, custom_solution, processing_details):
+            """应用用户自定义的异常值处理方案"""
+            print(f"🔄 应用自定义方案: {custom_solution}")
+
+            # 使用LLM解析和执行自定义方案
+            try:
+                numeric_cols = processing_details.get('numeric_cols', [])
+                outlier_info = processing_details.get('outlier_info', {})
+
+                execution_prompt = f"""请解析并执行以下异常值处理方案：
+
+数据集信息:
+- 形状: {df.shape}
+- 列名: {list(df.columns)}
+- 数值列: {numeric_cols}
+- 异常值信息: {outlier_info}
+
+自定义方案: "{custom_solution}"
+
+请生成Python代码来执行这个方案，只返回代码部分："""
+
+                response = self.app.llm.invoke(execution_prompt)
+                code = response.content.strip()
+
+                # 安全地执行代码
+                local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
+                exec(code, {}, local_vars)
+
+                result_df = local_vars['df']
+                print("✅ 自定义方案执行成功！")
+                return result_df
+
+            except Exception as e:
+                print(f"❌ 自定义方案执行失败: {e}")
+                print("⚠️ 使用建议方案代替")
+                return self.apply_suggested_solution(df, processing_details.get('numeric_cols', []))
+
+        def apply_suggested_solution(self, df, numeric_cols):
+            """应用建议的异常值处理方案"""
+            print("🔄 应用建议的异常值处理方案")
+
+            for col in numeric_cols:
+                if col in df.columns:
+                    col_data = df[col].dropna()
+                    if len(col_data) > 0:
+                        Q1 = col_data.quantile(0.25)
+                        Q3 = col_data.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+
+                        outliers = ((df[col] < lower_bound) | (df[col] > upper_bound)).sum()
+                        outlier_ratio = outliers / len(df) if len(df) > 0 else 0
+
+                        if outlier_ratio < 0.05:
+                            print(f"📊 {col}: 异常值比例 {outlier_ratio:.2%} < 5%，保留")
+                        elif outlier_ratio > 0.2:
+                            print(f"📈 {col}: 异常值比例 {outlier_ratio:.2%} > 20%，进行对数变换")
+                            # 避免对非正数取对数
+                            if (df[col] > 0).all():
+                                df[col] = np.log1p(df[col])
+                            else:
+                                print(f"  ⚠️ {col} 包含非正值，无法进行对数变换，使用缩尾处理")
+                                df[col] = np.clip(df[col], lower_bound, upper_bound)
+                        else:
+                            print(f"⚖️ {col}: 异常值比例 {outlier_ratio:.2%}，进行缩尾处理")
+                            df[col] = np.clip(df[col], lower_bound, upper_bound)
+
+            print("✅ 异常值处理完成！")
+            return df
+
     def detect_data_issues(self):
         """检测数据中的所有问题"""
         issues = []
@@ -373,6 +749,27 @@ class DataCleaningApp:
         duplicate_count = self.current_data.duplicated().sum()
         if duplicate_count > 0:
             issues.append(('duplicate', f"发现 {duplicate_count} 个重复行"))
+
+        # 检测异常值（简单检测数值列）
+        numeric_cols = self.current_data.select_dtypes(include=['int64', 'float64']).columns
+        if len(numeric_cols) > 0:
+            # 简单检查是否有明显异常值
+            has_outliers = False
+            for col in numeric_cols:
+                col_data = self.current_data[col].dropna()
+                if len(col_data) > 0:
+                    Q1 = col_data.quantile(0.25)
+                    Q3 = col_data.quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    outliers = ((self.current_data[col] < lower_bound) | (self.current_data[col] > upper_bound)).sum()
+                    if outliers > 0:
+                        has_outliers = True
+                        break
+
+            if has_outliers:
+                issues.append(('outlier', f"发现 {len(numeric_cols)} 个数值列需要异常值检测"))
 
         return issues
 
@@ -402,6 +799,7 @@ class DataCleaningApp:
         # 初始化处理器
         missing_handler = self.MissingValueHandler(self)
         duplicate_handler = self.DuplicateHandler(self)
+        outlier_handler = self.OutlierHandler(self)
 
         while True:
             print("\n" + "=" * 60)
@@ -417,7 +815,7 @@ class DataCleaningApp:
 
             if not issues:
                 print("\n✅ 数据质量良好，未发现明显问题！")
-                continue
+                break
 
             # 引导用户依次处理每个问题
             print(f"\n📋 共发现 {len(issues)} 个数据问题，我将引导您依次处理:")
@@ -433,11 +831,14 @@ class DataCleaningApp:
                 elif issue_type == 'duplicate':
                     print("🔍 正在处理重复值问题...")
                     self.current_data, _ = duplicate_handler.handle_interactive(self.current_data)
+                elif issue_type == 'outlier':
+                    print("🔍 正在处理异常值问题...")
+                    self.current_data, _ = outlier_handler.handle_interactive(self.current_data)
 
                 # 显示处理后的数据状态
                 print(f"\n✅ 当前数据形状: {self.current_data.shape}")
 
-                # 自动继续处理下一个问题，不再询问
+                # 自动继续处理下一个问题
                 if i < len(issues):
                     print("⏭️ 自动继续处理下一个问题...")
 
@@ -445,6 +846,11 @@ class DataCleaningApp:
             print(f"\n{'=' * 60}")
             print("所有检测到的问题已处理完成！")
             print(f"{'=' * 60}")
+
+            # 询问是否继续或退出
+            choice = input("\n是否继续检测其他问题？(yes/no): ").lower().strip()
+            if choice not in ['yes', 'y', '是']:
+                break
 
     def execute_custom_cleaning(self, user_instructions, config):
         """执行自定义清洗指令"""
@@ -513,6 +919,7 @@ class DataCleaningApp:
             traceback.print_exc()
 
     def run(self):
+        """运行应用程序"""
         self.interactive_cleaning_session()
 
 
