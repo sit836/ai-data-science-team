@@ -507,11 +507,11 @@ custom_solution|使用平均值填充缺失值"""
                     "duplicate_sample": duplicates.head(3).to_dict(),
                     "suggested_solution": suggested_solution
                 },
-                current_response=f"建议的重复值处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
+                current_response=f"建议的数据处理方案是：{suggested_solution}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
             )
 
             # 运行对话
-            final_state = self.app.run_conversation(initial_state)
+            final_state = self.run_conversation(initial_state)
 
             if final_state.agreed:
                 if final_state.custom_solution_proposed and final_state.custom_solution:
@@ -526,22 +526,377 @@ custom_solution|使用平均值填充缺失值"""
                 print("⏭️ 用户取消处理，跳过重复值处理")
                 return current_data, True
 
+        def run_conversation(self, initial_state: ConversationState) -> ConversationState:
+            """运行对话直到用户同意或退出 - 专门处理重复值场景"""
+            state = initial_state
+            educated_about_duplicates = False  # 标记是否已经教育过用户
+
+            while not state.agreed:
+                # 显示AI的响应
+                if state.current_response:
+                    print(f"\n🤖 {state.current_response}")
+
+                # 获取用户输入
+                while True:
+                    user_input = input("\n💬 您有什么疑问吗？如果没有疑问，请输入'继续'开始处理: ")
+                    if user_input.strip():
+                        break
+                    print("❌ 输入不能为空，请重新输入")
+
+                # 使用LLM判断用户意图
+                intent, custom_solution = self.llm_intent_detection_with_fallback(user_input, state.processing_type)
+
+                if intent == "agree":
+                    state.agreed = True
+                    break
+                elif intent == "disagree":
+                    print("❌ 您不同意当前方案，将取消处理")
+                    state.agreed = False
+                    break
+                elif intent == "custom_solution":
+                    # 检查是否是保留重复的方案
+                    if self.is_keep_duplicates_intent(custom_solution or user_input):
+                        if not educated_about_duplicates:
+                            # 第一次提出保留重复，教育用户
+                            self.educate_user_about_duplicates()
+                            educated_about_duplicates = True
+                            # 返回初始对话格式
+                            state.current_response = f"建议的数据处理方案是：{state.processing_details['suggested_solution']}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
+                            continue
+                        else:
+                            # 用户已经受过教育但仍然坚持保留重复
+                            print("⚠️ 您坚持保留重复行，但这会导致严重的技术问题。")
+                            print("🔧 我们将为您添加一个标识列来标记重复行，而不是完全保留重复数据。")
+
+                            # 创建一个合理的替代方案
+                            alternative_solution = "添加重复标识列并保留所有数据"
+                            state.custom_solution_proposed = True
+                            state.custom_solution = alternative_solution
+                            state.agreed = True
+                            break
+
+                    # 用户提出了其他自定义方案
+                    state.custom_solution_proposed = True
+                    state.custom_solution = custom_solution or user_input
+
+                    # 使用LLM评估自定义方案的合理性
+                    is_reasonable, feedback = self.llm_evaluate_solution_with_fallback(
+                        state.custom_solution, state.processing_type, state.processing_details
+                    )
+
+                    if is_reasonable:
+                        print(f"\n✅ {feedback}")
+                        confirmation = input("是否确认执行此方案？(yes/no): ").lower().strip()
+                        if confirmation in ['yes', 'y', '是', '确认']:
+                            state.agreed = True
+                            break
+                        else:
+                            print("请重新考虑您的方案或提出新的方案")
+                            state.current_response = f"建议的数据处理方案是：{state.processing_details['suggested_solution']}\n\n您对这个方案有什么疑问吗？或者您有自定义的处理方案？"
+                    else:
+                        print(f"\n⚠️ {feedback}")
+                        state.current_response = f"建议的数据处理方案是：{state.processing_details['suggested_solution']}\n\n关于您的方案: {feedback}\n请考虑修改或提出其他处理方案。"
+
+                    continue
+
+                # 用户有问题，使用LLM生成回答
+                state.messages.append({"role": "user", "content": user_input})
+
+                ai_response = self.llm_generate_response_with_fallback(
+                    user_input, state.processing_type, state.messages, state.processing_details
+                )
+
+                state.messages.append({"role": "assistant", "content": ai_response})
+                state.current_response = ai_response
+
+            return state
+
+        def is_keep_duplicates_intent(self, user_input: str) -> bool:
+            """判断用户是否想要保留重复行"""
+            user_input_lower = user_input.lower()
+            keep_keywords = [
+                '保留所有', '都保留', '两行都要', '不删除', '保留重复', '全部保留', '不要删除',
+                'keep all', 'keep both', 'don\'t delete', 'not remove', '保留全部'
+            ]
+            return any(keyword in user_input_lower for keyword in keep_keywords)
+
+        def educate_user_about_duplicates(self):
+            """教育用户关于重复行的问题"""
+            education_message = """\n🚨 重要技术说明：为什么必须处理重复行？
+
+    从机器学习和贝叶斯优化的角度，重复行会导致严重的数值稳定性问题：
+
+    1. **贝叶斯优化器内在设计限制**：
+       - 重复数据会使协方差矩阵奇异（singular），导致矩阵求逆失败
+       - 高斯过程回归中的核函数计算会出现数值不稳定
+       - 后验分布计算可能产生错误或无法收敛
+
+    2. **数值稳定性问题**：
+       - 重复行会导致特征矩阵的条件数恶化，影响数值精度
+       - 梯度计算会出现数值误差累积，影响优化效果
+       - 正则化项可能无法有效防止过拟合
+
+    3. **统计偏差和过拟合**：
+       - 重复数据扭曲真实的数据分布，导致模型偏见
+       - 模型会过度拟合重复的模式，降低泛化能力
+       - 评估指标会产生误导性结果，影响模型选择
+
+    基于以上技术原因，完全保留重复行是不可行的。"""
+
+            print(education_message)
+
+        def llm_intent_detection_with_fallback(self, user_input: str, processing_type: str,
+                                               max_retries: int = 2) -> tuple:
+            """使用LLM判断用户意图，带重试和降级处理"""
+            for attempt in range(max_retries):
+                try:
+                    intent, custom_solution = self.llm_classify_intent(user_input, processing_type)
+                    return intent, custom_solution
+                except Exception as e:
+                    print(f"❌ 意图识别尝试 {attempt + 1} 失败: {e}")
+                    time.sleep(1)  # 短暂等待后重试
+
+            # 所有重试都失败，使用降级逻辑
+            print("⚠️ LLM不可用，使用备用意图检测")
+            return self.fallback_intent_detection(user_input), user_input
+
+        def llm_classify_intent(self, user_input: str, processing_type: str) -> tuple:
+            """使用LLM判断用户意图 - 优化版本"""
+            intent_prompt = f"""请严格分析用户意图，只能返回以下4种意图之一：
+
+        用户输入: "{user_input}"
+        处理场景: 重复值处理
+
+        可选意图：
+        1. agree - 用户明确同意当前方案（包含：继续、同意、好的、没问题、行、可以）
+        2. disagree - 用户明确拒绝当前方案（包含：不、不要、取消、停止、退出、拒绝）
+        3. question - 用户提出问题或需要解释（包含：为什么、怎么、如何、解释、说明、什么）
+        4. custom_solution - 用户提出了自定义处理方案（包含：用、改成、建议、自定义、我想、我要）
+
+        判断规则：
+        - 如果用户只是简单确认，返回agree
+        - 如果用户明确拒绝，返回disagree  
+        - 如果用户询问原因或方法，返回question
+        - 如果用户提出具体处理方式，返回custom_solution
+
+        返回格式：意图|方案内容（只有custom_solution时才需要方案内容）
+
+        示例：
+        用户: "继续" -> agree|
+        用户: "不要删除" -> disagree|
+        用户: "为什么这样处理" -> question|
+        用户: "保留所有重复行" -> custom_solution|保留所有重复行
+        用户: "我想只删除完全一样的" -> custom_solution|只删除完全相同的行
+        用户: "用众数填充" -> custom_solution|用众数填充"""
+
+            try:
+                response = self.app.llm.invoke(intent_prompt)
+                result = response.content.strip()
+                print(f"DEBUG: LLM返回结果: {result}")  # 调试信息
+
+                if "|" in result:
+                    intent, custom_solution = result.split("|", 1)
+                    intent = intent.strip().lower()
+                    custom_solution = custom_solution.strip()
+
+                    # 验证意图是否有效
+                    valid_intents = ["agree", "disagree", "question", "custom_solution"]
+                    if intent in valid_intents:
+                        # 对于custom_solution，如果没有提取到内容，使用用户输入
+                        if intent == "custom_solution" and not custom_solution:
+                            custom_solution = user_input
+                        return intent, custom_solution
+                    else:
+                        # 意图不在有效列表中，使用降级检测
+                        print(f"⚠️ LLM返回无效意图: {intent}，使用降级检测")
+                        return self.fallback_intent_detection(user_input), user_input
+                else:
+                    # 格式不正确，使用降级检测
+                    print("⚠️ LLM返回格式不正确，使用降级检测")
+                    return self.fallback_intent_detection(user_input), user_input
+
+            except Exception as e:
+                print(f"❌ LLM意图识别错误: {e}")
+                # 出错时使用降级检测
+                return self.fallback_intent_detection(user_input), user_input
+
+        def fallback_intent_detection(self, user_input: str) -> str:
+            """改进的备用意图检测方法"""
+            user_input_lower = user_input.lower().strip()
+
+            # 更精确的关键词匹配
+            agree_patterns = [
+                r'^继续$', r'^开始$', r'^同意$', r'^好的$', r'^没问题$',
+                r'^行$', r'^可以$', r'^ok$', r'^yes$', r'^y$', r'^是$',
+                r'^确认$', r'^执行$', r'^就这么办$'
+            ]
+
+            disagree_patterns = [
+                r'^不$', r'^不要$', r'^取消$', r'^停止$', r'^退出$',
+                r'^no$', r'^n$', r'^拒绝$', r'^不同意$', r'^放弃$',
+                r'^算了$', r'^不用了$'
+            ]
+
+            question_patterns = [
+                r'为什么', r'怎么', r'如何', r'解释', r'说明', r'什么',
+                r'原因', r'方法', r'?\?', r'？', r'请教', r'问一下'
+            ]
+
+            custom_patterns = [
+                r'用.+', r'改成', r'建议', r'自定义', r'我想', r'我要',
+                r'保留', r'删除', r'填充', r'处理', r'方案', r'应该',
+                r'不如', r'最好', r'推荐'
+            ]
+
+            # 检查匹配模式
+            for pattern in agree_patterns:
+                if re.search(pattern, user_input_lower):
+                    return "agree"
+
+            for pattern in disagree_patterns:
+                if re.search(pattern, user_input_lower):
+                    return "disagree"
+
+            for pattern in custom_patterns:
+                if re.search(pattern, user_input_lower):
+                    return "custom_solution"
+
+            for pattern in question_patterns:
+                if re.search(pattern, user_input_lower):
+                    return "question"
+
+            # 默认认为是问题
+            return "question"
+
+        def llm_evaluate_solution_with_fallback(self, custom_solution: str, processing_type: str,
+                                                processing_details: Dict,
+                                                max_retries: int = 2) -> tuple:
+            """使用LLM评估方案合理性，带重试"""
+            for attempt in range(max_retries):
+                try:
+                    return self.llm_evaluate_solution(custom_solution, processing_type, processing_details)
+                except Exception as e:
+                    print(f"❌ 方案评估尝试 {attempt + 1} 失败: {e}")
+                    time.sleep(1)
+
+            # 评估失败时的降级处理
+            print("⚠️ LLM评估不可用，使用默认评估")
+            return True, "方案评估不可用，将执行您的自定义方案"
+
+        def llm_evaluate_solution(self, custom_solution: str, processing_type: str, processing_details: Dict) -> tuple:
+            """使用LLM评估自定义方案的合理性"""
+            # 检查是否是保留重复的方案
+            if self.is_keep_duplicates_intent(custom_solution):
+                return False, "保留所有重复行会导致数值稳定性问题，请选择其他处理方案"
+
+            evaluation_prompt = f"""作为数据清洗专家，请评估用户提出的重复值处理方案。
+
+    当前重复值情况:
+    - 重复行数: {processing_details['duplicate_count']}
+    - 建议方案: {processing_details['suggested_solution']}
+
+    用户方案: "{custom_solution}"
+
+    请从以下角度评估：
+    1. 技术合理性（是否符合数据清洗最佳实践）
+    2. 对数据完整性的影响
+    3. 对后续机器学习算法的影响
+    4. 数值稳定性考虑
+    5. 潜在的风险或问题
+    6. 改进建议（如有）
+
+    请用友好、专业的态度回复，返回格式：合理与否(true/false)|评估反馈"""
+
+            try:
+                response = self.app.llm.invoke(evaluation_prompt)
+                result = response.content.strip()
+
+                if "|" in result:
+                    is_reasonable_str, feedback = result.split("|", 1)
+                    is_reasonable = is_reasonable_str.strip().lower() == "true"
+                    return is_reasonable, feedback.strip()
+
+                raise ValueError("LLM评估返回格式不正确")
+
+            except Exception as e:
+                print(f"❌ LLM方案评估错误: {e}")
+                raise
+
+        def llm_generate_response_with_fallback(self, user_input: str, processing_type: str, messages: List[Dict],
+                                                processing_details: Dict, max_retries: int = 2) -> str:
+            """使用LLM生成回答，带重试"""
+            for attempt in range(max_retries):
+                try:
+                    return self.llm_generate_response(user_input, processing_type, messages, processing_details)
+                except Exception as e:
+                    print(f"❌ 回答生成尝试 {attempt + 1} 失败: {e}")
+                    time.sleep(1)
+
+            # 生成回答失败时的降级处理
+            return self.get_fallback_response(processing_type, user_input, processing_details)
+
+        def llm_generate_response(self, user_input: str, processing_type: str, messages: List[Dict],
+                                  processing_details: Dict) -> str:
+            """使用LLM生成专业回答"""
+            # 构建对话上下文
+            conversation_context = "\n".join([
+                f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+                for msg in messages[-3:]  # 最近3条消息
+            ])
+
+            system_prompt = f"""你是一个数据清洗专家，专门处理重复值问题。
+
+    当前重复值情况：
+    - 重复行数量: {processing_details['duplicate_count']}
+    - 建议方案: {processing_details['suggested_solution']}
+
+    请用中文友好、专业地回答用户关于重复值处理的问题。"""
+
+            prompt = f"""{system_prompt}
+
+    当前对话上下文：
+    {conversation_context}
+
+    用户最新问题: "{user_input}"
+
+    请生成友好、专业的回答："""
+
+            try:
+                response = self.app.llm.invoke(prompt)
+                return response.content
+            except Exception as e:
+                print(f"❌ LLM回答生成错误: {e}")
+                raise
+
+        def get_fallback_response(self, processing_type: str, user_input: str, processing_details: Dict) -> str:
+            """获取备用回答"""
+            return f"关于您的输入'{user_input}'，在重复值处理中，我们建议删除完全重复的行以保持数据质量。"
+
         def apply_custom_solution(self, df, custom_solution, processing_details):
             """应用用户自定义的重复值处理方案"""
             print(f"🔄 应用自定义方案: {custom_solution}")
 
-            # 使用LLM解析和执行自定义方案
+            # 检查是否是保留重复的方案
+            if self.is_keep_duplicates_intent(custom_solution):
+                # 为用户创建一个合理的替代方案：添加重复标识列
+                print("🔧 为您添加重复标识列并保留所有数据...")
+                df_cleaned = df.copy()
+                df_cleaned['is_duplicate'] = df_cleaned.duplicated(keep=False)
+                print(f"✅ 已添加重复标识列，标记了 {df_cleaned['is_duplicate'].sum()} 个重复行")
+                return df_cleaned
+
+            # 使用LLM解析和执行其他自定义方案
             try:
                 execution_prompt = f"""请解析并执行以下重复值处理方案：
 
-数据集信息:
-- 形状: {df.shape}
-- 列名: {list(df.columns)}
-- 重复行数: {processing_details['duplicate_count']}
+    数据集信息:
+    - 形状: {df.shape}
+    - 列名: {list(df.columns)}
+    - 重复行数: {processing_details['duplicate_count']}
 
-自定义方案: "{custom_solution}"
+    自定义方案: "{custom_solution}"
 
-请生成Python代码来执行这个方案，只返回代码部分："""
+    请生成Python代码来执行这个方案，只返回代码部分："""
 
                 response = self.app.llm.invoke(execution_prompt)
                 code = response.content.strip()
@@ -552,7 +907,7 @@ custom_solution|使用平均值填充缺失值"""
 
                 result_df = local_vars['df']
                 removed_count = len(df) - len(result_df)
-                print(f"✅ 自定义方案执行成功！删除了 {removed_count} 个重复行")
+                print(f"✅ 自定义方案执行成功！处理了 {removed_count} 个重复行")
                 return result_df
 
             except Exception as e:
