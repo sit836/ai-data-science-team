@@ -1,26 +1,26 @@
 import operator
 import os
-from typing import Any, Optional, Annotated, Sequence, List, Dict
-
+from typing import Any, Optional, Annotated, Sequence, List, Dict, TypedDict
 import numpy as np
 import pandas as pd
 from IPython.display import Markdown
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langgraph.graph import START, END, StateGraph
-from langgraph.prebuilt import create_react_agent, ToolNode
-from langgraph.prebuilt.chat_agent_executor import AgentState
+from langgraph.prebuilt import create_react_agent
 from langgraph.types import Checkpointer
 from scipy.optimize import minimize
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
-from ai_data_science_team.templates import BaseAgent
-from ai_data_science_team.utils.messages import get_tool_call_names
-from ai_data_science_team.utils.regex import format_agent_name
+# 加载环境变量
+load_dotenv()
 
 AGENT_NAME = "bayesian_optimization_agent"
+
+# 定义可用列名
+AVAILABLE_COLUMNS = ['特征1', '特征2', '特征3', '特征4', '特征5', '目标值']
 
 
 class BayesianOptimizer:
@@ -84,444 +84,441 @@ class BayesianOptimizer:
         self.y.append(y)
 
 
-class BayesianOptimizationAgent(BaseAgent):
-    """
-    贝叶斯优化智能体，用于超参数优化和实验设计。
-    """
-
-    def __init__(
-            self,
-            model: Any,
-            create_react_agent_kwargs: Optional[Dict] = {},
-            invoke_react_agent_kwargs: Optional[Dict] = {},
-            checkpointer: Optional[Checkpointer] = None,
-    ):
-        self._params = {
-            "model": model,
-            "create_react_agent_kwargs": create_react_agent_kwargs,
-            "invoke_react_agent_kwargs": invoke_react_agent_kwargs,
-            "checkpointer": checkpointer,
-        }
-        self._compiled_graph = self._make_compiled_graph()
-        self.response = None
-        self.optimizer = None
-        self.current_suggestion = None
-
-    def _make_compiled_graph(self):
-        """创建编译图"""
-        self.response = None
-        return make_bayesian_optimization_agent(**self._params)
-
-    def update_params(self, **kwargs):
-        """更新参数并重新编译图"""
-        for k, v in kwargs.items():
-            self._params[k] = v
-        self._compiled_graph = self._make_compiled_graph()
-
-    async def ainvoke_agent(self, user_instructions: str = None, **kwargs):
-        """异步运行代理"""
-        response = await self._compiled_graph.ainvoke(
-            {
-                "user_instructions": user_instructions,
-                "optimizer_state": self.optimizer.__dict__ if self.optimizer else {},
-                "current_suggestion": self.current_suggestion,
-            },
-            **kwargs
-        )
-        self.response = response
-        return None
-
-    def invoke_agent(self, user_instructions: str = None, **kwargs):
-        """运行代理"""
-        response = self._compiled_graph.invoke(
-            {
-                "user_instructions": user_instructions,
-                "optimizer_state": self.optimizer.__dict__ if self.optimizer else {},
-                "current_suggestion": self.current_suggestion,
-            },
-            **kwargs
-        )
-        self.response = response
-        return None
-
-    def get_internal_messages(self, markdown: bool = False):
-        """返回内部消息"""
-        pretty_print = "\n\n".join([f"### {msg.type.upper()}\n\nID: {msg.id}\n\n内容:\n\n{msg.content}" for msg in
-                                    self.response["internal_messages"]])
-        if markdown:
-            return Markdown(pretty_print)
-        else:
-            return self.response["internal_messages"]
-
-    def get_optimization_results(self, as_dataframe: bool = False):
-        """返回优化结果"""
-        if as_dataframe:
-            return pd.DataFrame(self.response["optimization_results"])
-        else:
-            return self.response["optimization_results"]
-
-    def get_ai_message(self, markdown: bool = False):
-        """返回AI消息"""
-        if markdown:
-            return Markdown(self.response["messages"][0].content)
-        else:
-            return self.response["messages"][0].content
-
-    def get_tool_calls(self):
-        """返回工具调用"""
-        return self.response["tool_calls"]
+class AgentState(TypedDict):
+    """代理状态定义"""
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    user_instructions: str
+    input_variables: List[str]
+    output_variable: str
+    optimization_goal: str
+    variable_bounds: Dict[str, tuple]
+    input_data: Optional[Dict[str, Any]]
+    optimizer_state: Optional[Dict[str, Any]]
+    current_suggestion: Optional[List[float]]
+    optimization_results: List[Dict[str, Any]]
+    confirmed_settings: bool
+    step: str  # 当前步骤: setup, confirm, optimize, complete
+    need_human_approval: bool
 
 
-def make_bayesian_optimization_agent(
-        model: Any,
-        create_react_agent_kwargs: Optional[Dict] = {},
-        invoke_react_agent_kwargs: Optional[Dict] = {},
-        checkpointer: Optional[Checkpointer] = None,
-):
-    """
-    创建贝叶斯优化代理
-    """
+def validate_variable_name(var_name: str) -> bool:
+    """验证变量名是否存在于可用列中"""
+    return var_name in AVAILABLE_COLUMNS
 
-    class GraphState(AgentState):
-        internal_messages: Annotated[Sequence[BaseMessage], operator.add]
-        user_instructions: str
-        optimization_results: dict
-        tool_calls: List[str]
-        optimizer_state: dict
-        current_suggestion: list
-        confirmed_parameters: bool
-        optimization_goal: str
-        input_variables: list
-        output_variable: str
-        variable_bounds: dict
-        input_data: dict
-        auto_mode: bool  # 新增：自动模式标志
-        user_confirmed_settings: bool  # 新增：用户确认设置标志
 
-    def bayesian_optimization_agent(state):
-        print(format_agent_name(AGENT_NAME))
-        print("    ")
+def validate_bounds(min_val: float, max_val: float) -> bool:
+    """验证最小值不大于最大值"""
+    return min_val <= max_val
 
-        print("    * 正在运行贝叶斯优化智能体")
 
-        # 定义工具
-        def identify_parameters(data_info: str, objective: str):
-            """识别优化参数和目标"""
-            # 检查是否有输入数据
+def get_validated_input_variables():
+    """获取并验证输入变量"""
+    while True:
+        print("\n请选择输入变量（特征列）:")
+        print(f"可用列: {AVAILABLE_COLUMNS}")
+        input_cols = input("请输入用逗号分隔的列名（例如: 特征1,特征2）: ").split(',')
+        input_cols = [col.strip() for col in input_cols]
+
+        # 验证变量名
+        invalid_vars = [var for var in input_cols if not validate_variable_name(var)]
+
+        if invalid_vars:
+            print(f"错误: 以下变量名不存在: {invalid_vars}")
+            print("请使用以下可用列:", AVAILABLE_COLUMNS)
+            continue
+
+        if not input_cols:
+            print("错误: 至少需要一个输入变量")
+            continue
+
+        return input_cols
+
+
+def get_validated_output_variable():
+    """获取并验证输出变量"""
+    while True:
+        print("\n请选择输出变量（目标列）:")
+        output_col = input("请输入列名: ").strip()
+
+        # 验证变量名
+        if not validate_variable_name(output_col):
+            print(f"错误: 变量名 '{output_col}' 不存在")
+            print("请使用以下可用列:", AVAILABLE_COLUMNS)
+            continue
+
+        return output_col
+
+
+def get_validated_bounds(var_name: str):
+    """获取并验证变量边界"""
+    while True:
+        try:
+            min_val = float(input(f"请输入变量 '{var_name}' 的最小值: "))
+            max_val = float(input(f"请输入变量 '{var_name}' 的最大值: "))
+
+            # 验证边界
+            if not validate_bounds(min_val, max_val):
+                print("错误: 最小值不能大于最大值，请重新输入")
+                continue
+
+            return min_val, max_val
+        except ValueError:
+            print("错误: 请输入有效的数字")
+
+
+def create_bayesian_optimization_agent(model: Any):
+    """创建贝叶斯优化代理"""
+
+    def setup_node(state: AgentState):
+        """设置节点 - 获取用户输入、输出和目标"""
+        print("\n=== 设置优化参数 ===")
+
+        # 获取并验证输入变量
+        input_cols = get_validated_input_variables()
+
+        # 获取并验证输出变量
+        output_col = get_validated_output_variable()
+
+        # 获取优化目标
+        print("\n请选择优化目标:")
+        goal = input("最大化还是最小化？(maximize/minimize): ").strip().lower()
+        while goal not in ["maximize", "minimize"]:
+            print("请输入有效的优化目标（maximize/minimize）")
+            goal = input("最大化还是最小化？(maximize/minimize): ").strip().lower()
+
+        # 获取并验证变量边界
+        print("\n请设置变量边界:")
+        variable_bounds = {}
+        for var in input_cols:
+            min_val, max_val = get_validated_bounds(var)
+            variable_bounds[var] = (min_val, max_val)
+
+        # 更新状态
+        state["input_variables"] = input_cols
+        state["output_variable"] = output_col
+        state["optimization_goal"] = goal
+        state["variable_bounds"] = variable_bounds
+        state["step"] = "confirm"
+        state["need_human_approval"] = True  # 需要人工审批
+
+        print("\n设置完成，等待确认...")
+        return state
+
+    def approval_node(state: AgentState):
+        """审批节点 - 用户确认或修改设置"""
+        print("\n=== 请确认优化设置 ===")
+        print(f"输入变量: {state['input_variables']}")
+        print(f"输出变量: {state['output_variable']}")
+        print(f"优化目标: {state['optimization_goal']}")
+        print("变量边界:")
+        for var, bounds in state['variable_bounds'].items():
+            print(f"  {var}: {bounds[0]} ~ {bounds[1]}")
+
+        print("\n选项:")
+        print("1. 确认设置并开始优化")
+        print("2. 修改输入变量")
+        print("3. 修改输出变量")
+        print("4. 修改优化目标")
+        print("5. 修改变量边界")
+
+        choice = input("\n请选择操作 (1-5): ").strip()
+
+        if choice == "1":
+            # 确认设置
+            state["confirmed_settings"] = True
+            state["step"] = "optimize"
+            state["need_human_approval"] = False
+            print("设置已确认，开始优化...")
+        elif choice == "2":
+            # 修改输入变量
+            print("\n当前输入变量:", state["input_variables"])
+            new_input_cols = get_validated_input_variables()
+            state["input_variables"] = new_input_cols
+
+            # 确保变量边界与新输入变量一致
+            new_bounds = {}
+            for var in new_input_cols:
+                if var in state["variable_bounds"]:
+                    new_bounds[var] = state["variable_bounds"][var]
+                else:
+                    print(f"\n需要为新增变量 '{var}' 设置边界:")
+                    min_val, max_val = get_validated_bounds(var)
+                    new_bounds[var] = (min_val, max_val)
+
+            state["variable_bounds"] = new_bounds
+            print("输入变量已更新")
+
+        elif choice == "3":
+            # 修改输出变量
+            print("\n当前输出变量:", state["output_variable"])
+            new_output_col = get_validated_output_variable()
+            state["output_variable"] = new_output_col
+            print("输出变量已更新")
+
+        elif choice == "4":
+            # 修改优化目标
+            print("\n当前优化目标:", state["optimization_goal"])
+            new_goal = input("请输入新的优化目标 (maximize/minimize): ").strip().lower()
+            while new_goal not in ["maximize", "minimize"]:
+                print("请输入有效的优化目标（maximize/minimize）")
+                new_goal = input("请输入新的优化目标 (maximize/minimize): ").strip().lower()
+            state["optimization_goal"] = new_goal
+            print("优化目标已更新")
+
+        elif choice == "5":
+            # 修改变量边界
+            print("\n当前变量边界:")
+            for var, bounds in state['variable_bounds'].items():
+                print(f"  {var}: {bounds[0]} ~ {bounds[1]}")
+
+            var_to_modify = input("请输入要修改的变量名: ").strip()
+            if var_to_modify in state["variable_bounds"]:
+                min_val, max_val = get_validated_bounds(var_to_modify)
+                state["variable_bounds"][var_to_modify] = (min_val, max_val)
+                print("变量边界已更新")
+            else:
+                print(f"变量 '{var_to_modify}' 不存在，请先添加到输入变量中")
+
+        # 无论修改什么，都需要重新确认
+        state["need_human_approval"] = True
+
+        return state
+
+    def validate_state(state: AgentState):
+        """验证状态是否一致"""
+        # 确保所有输入变量都有对应的边界
+        missing_bounds = []
+        for var in state["input_variables"]:
+            if var not in state["variable_bounds"]:
+                missing_bounds.append(var)
+
+        if missing_bounds:
+            print(f"\n警告: 以下变量缺少边界设置: {missing_bounds}")
+            print("请为这些变量设置边界:")
+            for var in missing_bounds:
+                min_val, max_val = get_validated_bounds(var)
+                state["variable_bounds"][var] = (min_val, max_val)
+
+        return state
+
+    def optimization_node(state: AgentState):
+        """优化节点 - 执行贝叶斯优化"""
+        print(f"\n--- 执行贝叶斯优化 ---")
+
+        # 首先验证状态一致性
+        state = validate_state(state)
+
+        # 获取或创建优化器
+        bounds_list = []
+        for var in state["input_variables"]:
+            if var in state["variable_bounds"]:
+                bounds_list.append(state["variable_bounds"][var])
+            else:
+                # 如果变量没有边界，使用默认边界
+                print(f"警告: 变量 '{var}' 没有边界设置，使用默认边界 [0, 1]")
+                bounds_list.append((0.0, 1.0))
+                state["variable_bounds"][var] = (0.0, 1.0)
+
+        if state.get("optimizer_state") is None:
+            optimizer = BayesianOptimizer(bounds_list)
+            # 如果有初始数据，初始化优化器
             if state.get("input_data") and "X" in state["input_data"] and "Y" in state["input_data"]:
                 X_data = state["input_data"]["X"]
                 Y_data = state["input_data"]["Y"]
+                if len(X_data) > 0 and len(Y_data) > 0:
+                    if len(Y_data.shape) > 1:
+                        Y_data = Y_data.flatten()
+                    optimizer.initialize(X_data.tolist(), Y_data.tolist())
+                    print(f"使用 {len(X_data)} 个初始数据点初始化优化器")
+        else:
+            optimizer = BayesianOptimizer(bounds_list)
+            optimizer.__dict__.update(state["optimizer_state"])
 
-                print(f"检测到输入数据: X形状={X_data.shape}, Y形状={Y_data.shape}")
+        # 获取建议参数
+        suggestion = optimizer.suggest_next_point()
+        state["current_suggestion"] = suggestion
 
-                # 自动识别变量
-                if len(X_data.shape) == 2:
-                    n_features = X_data.shape[1]
-                    input_vars = [f"参数_{i + 1}" for i in range(n_features)]
-                    print(f"自动识别到 {n_features} 个输入参数")
-                else:
-                    input_vars = ["输入参数"]
+        # 格式化建议
+        formatted_suggestion = {}
+        for i, var in enumerate(state["input_variables"]):
+            formatted_suggestion[var] = suggestion[i]
 
-                output_var = "输出结果"
+        # 显示建议参数
+        print("\n建议的参数:")
+        for var, value in formatted_suggestion.items():
+            print(f"  {var}: {value:.4f}")
 
-                # 自动确定边界
-                bounds = {}
-                for i, var in enumerate(input_vars):
-                    if len(X_data.shape) == 2:
-                        min_val = float(np.min(X_data[:, i]))
-                        max_val = float(np.max(X_data[:, i]))
-                    else:
-                        min_val = float(np.min(X_data))
-                        max_val = float(np.max(X_data))
-                    bounds[var] = (min_val, max_val)
+        # 保存优化器状态
+        state["optimizer_state"] = optimizer.__dict__
 
-                # 自动确定优化目标（基于数据趋势）
-                if np.mean(Y_data) > np.median(Y_data):
-                    goal = "maximize"
-                else:
-                    goal = "minimize"
+        # 请求用户输入实验结果
+        print("\n请输入实验结果:")
+        result = float(input("结果值: "))
 
-                print(f"自动设置优化目标: {'最大化' if goal == 'maximize' else '最小化'}")
+        # 更新优化器
+        optimizer.update(suggestion, result)
 
-                return {
-                    "status": "参数已自动识别",
-                    "optimization_goal": goal,
-                    "input_variables": input_vars,
-                    "output_variable": output_var,
-                    "variable_bounds": bounds,
-                    "auto_mode": True
-                }
+        # 记录结果
+        result_entry = {
+            "parameters": formatted_suggestion,
+            "result": result
+        }
+        state["optimization_results"].append(result_entry)
 
-            return {
-                "status": "需要手动输入参数",
-                "auto_mode": False
-            }
-
-        def get_user_settings():
-            """获取用户设置"""
-            print("请提供以下信息:")
-
-            # 获取输入变量
-            input_vars = input("请输入输入变量名称（用逗号分隔）: ").split(',')
-            input_vars = [var.strip() for var in input_vars]
-
-            # 获取输出变量
-            output_var = input("请输入输出变量名称: ").strip()
-
-            # 获取优化目标
-            goal = input("请输入优化目标（maximize/minimize）: ").strip().lower()
-            while goal not in ["maximize", "minimize"]:
-                print("请输入有效的优化目标（maximize/minimize）")
-                goal = input("请输入优化目标（maximize/minimize）: ").strip().lower()
-
-            # 获取变量边界
-            bounds = {}
-            for var in input_vars:
-                min_val = float(input(f"请输入变量 {var} 的最小值: "))
-                max_val = float(input(f"请输入变量 {var} 的最大值: "))
-                bounds[var] = (min_val, max_val)
-
-            return {
-                "input_variables": input_vars,
-                "output_variable": output_var,
-                "optimization_goal": goal,
-                "variable_bounds": bounds
-            }
-
-        def confirm_settings(settings: dict):
-            """确认设置"""
-            print("\n请确认以下设置:")
-            print(f"输入变量: {settings['input_variables']}")
-            print(f"输出变量: {settings['output_variable']}")
-            print(f"优化目标: {settings['optimization_goal']}")
-            print("变量边界:")
-            for var, bound in settings['variable_bounds'].items():
-                print(f"  {var}: {bound}")
-
-            response = input("\n确认这些设置吗？（是/否）: ").strip().lower()
-            if response in ["是", "yes", "y"]:
-                return {"confirmed": True}
+        # 显示当前最佳结果
+        if optimizer.y:
+            if state["optimization_goal"] == "maximize":
+                best_result = max(optimizer.y)
             else:
-                return {"confirmed": False}
+                best_result = min(optimizer.y)
+            print(f"更新完成！当前最佳结果: {best_result:.4f}")
+            print(f"总评估次数: {len(optimizer.y)}")
+        else:
+            print("更新完成！这是第一次评估。")
 
-        def suggest_next_parameters(optimizer_state: dict):
-            """建议下一组参数"""
-            bounds_list = []
-            input_vars = state.get("input_variables", [])
-            variable_bounds = state.get("variable_bounds", {})
+        # 保存更新后的优化器状态
+        state["optimizer_state"] = optimizer.__dict__
 
-            for var in input_vars:
-                if var in variable_bounds:
-                    bounds_list.append(variable_bounds[var])
+        # 询问是否继续优化
+        continue_opt = input("\n是否继续优化？(y/n): ").strip().lower()
+        if continue_opt in ["y", "yes", "是"]:
+            state["step"] = "optimize"
+        else:
+            state["step"] = "complete"
 
-            # 创建或恢复优化器
-            if not state.get("optimizer_state") or not state["optimizer_state"].get("bounds"):
-                optimizer = BayesianOptimizer(bounds_list)
-                # 如果有初始数据，初始化优化器
-                if state.get("input_data") and "X" in state["input_data"] and "Y" in state["input_data"]:
-                    X_data = state["input_data"]["X"]
-                    Y_data = state["input_data"]["Y"]
-                    if len(X_data) > 0 and len(Y_data) > 0:
-                        # 确保数据格式正确
-                        if len(Y_data.shape) > 1:
-                            Y_data = Y_data.flatten()
-                        optimizer.initialize(X_data.tolist(), Y_data.tolist())
-                        print(f"使用 {len(X_data)} 个初始数据点初始化优化器")
+        return state
+
+    def results_node(state: AgentState):
+        """结果节点 - 显示最终优化结果"""
+        print("\n=== 优化完成 ===")
+        results = state["optimization_results"]
+
+        if results:
+            print(f"完成了 {len(results)} 次优化迭代")
+
+            # 找到最佳结果
+            if state["optimization_goal"] == "maximize":
+                best_result = max(results, key=lambda x: x["result"])
             else:
-                optimizer = BayesianOptimizer(bounds_list)
-                optimizer.__dict__.update(state["optimizer_state"])
+                best_result = min(results, key=lambda x: x["result"])
 
-            # 获取建议
-            suggestion = optimizer.suggest_next_point()
-            print(f"建议的下一个参数点: {suggestion}")
+            print(f"\n最佳参数组合:")
+            for param, value in best_result["parameters"].items():
+                print(f"  {param}: {value:.4f}")
+            print(f"最佳结果值: {best_result['result']:.4f}")
 
-            # 格式化建议
-            formatted_suggestion = {}
-            for i, var in enumerate(input_vars):
-                formatted_suggestion[var] = suggestion[i]
+            # 显示所有优化历史
+            print(f"\n优化历史:")
+            for i, result in enumerate(results, 1):
+                print(f"迭代 {i}: 结果 = {result['result']:.4f}")
+        else:
+            print("没有优化结果记录")
 
-            # 保存状态
-            state["optimizer_state"] = optimizer.__dict__
-            state["current_suggestion"] = suggestion
+        state["step"] = "end"
+        return state
 
-            return {"suggestion": formatted_suggestion}
+    # 创建图
+    workflow = StateGraph(AgentState)
 
-        def confirm_parameters(parameters: dict):
-            """确认参数设置"""
-            print("建议的参数如下:")
-            for var, value in parameters.items():
-                print(f"{var}: {value}")
+    # 添加节点
+    workflow.add_node("setup", setup_node)
+    workflow.add_node("approval", approval_node)
+    workflow.add_node("optimize", optimization_node)
+    workflow.add_node("results", results_node)
 
-            # 在自动模式下自动确认
-            if state.get("auto_mode", False):
-                print("自动模式：使用建议参数")
-                return {"confirmed": True}
+    # 定义流程
+    workflow.add_edge(START, "setup")
+    workflow.add_edge("setup", "approval")
 
-            print("您想要使用这些参数吗？（是/否）")
-            response = input().strip().lower()
+    # 使用条件边处理审批结果
+    def after_approval(state: AgentState):
+        if state.get("confirmed_settings", False):
+            return "optimize"
+        else:
+            return "approval"  # 需要重新审批
 
-            if response in ["是", "yes", "y"]:
-                return {"confirmed": True}
-            else:
-                print("请提供您偏好的参数值:")
-                custom_params = {}
-                for var in parameters.keys():
-                    print(f"{var}:")
-                    value = float(input().strip())
-                    custom_params[var] = value
+    workflow.add_conditional_edges("approval", after_approval)
 
-                state["current_suggestion"] = [custom_params[var] for var in state.get("input_variables", [])]
-                return {"confirmed": True, "custom_parameters": custom_params}
+    # 优化节点的后续流程
+    def after_optimization(state: AgentState):
+        if state.get("step") == "complete":
+            return "results"
+        else:
+            return "optimize"  # 继续优化
 
-        def update_optimization_result(parameters: list, result: float):
-            """更新优化结果"""
-            bounds_list = []
-            input_vars = state.get("input_variables", [])
-            variable_bounds = state.get("variable_bounds", {})
+    workflow.add_conditional_edges("optimize", after_optimization)
+    workflow.add_edge("results", END)
 
-            for var in input_vars:
-                if var in variable_bounds:
-                    bounds_list.append(variable_bounds[var])
+    return workflow.compile()
 
-            if not state.get("optimizer_state") or not state["optimizer_state"].get("bounds"):
-                optimizer = BayesianOptimizer(bounds_list)
-            else:
-                optimizer = BayesianOptimizer(bounds_list)
-                optimizer.__dict__.update(state["optimizer_state"])
 
-            # 更新优化器
-            optimizer.update(parameters, result)
+class BayesianOptimizationAgent:
+    """
+    贝叶斯优化智能体，使用LangGraph中断和人工审批功能。
+    """
 
-            # 保存状态
-            state["optimizer_state"] = optimizer.__dict__
-
-            # 更新优化结果
-            if "optimization_results" not in state:
-                state["optimization_results"] = []
-
-            result_entry = {
-                "parameters": dict(zip(input_vars, parameters)),
-                "result": result
-            }
-            state["optimization_results"].append(result_entry)
-
-            best_result = max(optimizer.y) if state.get("optimization_goal") == "maximize" else min(optimizer.y)
-            print(f"更新完成！当前最佳结果: {best_result}")
-
-            return {
-                "status": "已更新",
-                "best_result": best_result,
-                "total_evaluations": len(optimizer.y)
-            }
-
-        tools = [
-            identify_parameters,
-            get_user_settings,
-            confirm_settings,
-            suggest_next_parameters,
-            confirm_parameters,
-            update_optimization_result,
-        ]
-
-        tool_node = ToolNode(tools=tools)
-
-        # 创建提示模板，指导模型使用工具
-        system_prompt = """你是一个贝叶斯优化专家。请按照以下步骤执行优化：
-        1. 首先询问用户输入变量、输出变量和优化目标
-        2. 确认用户设置
-        3. 调用suggest_next_parameters获取建议参数
-        4. 调用confirm_parameters确认参数
-        5. 获取实验结果后调用update_optimization_result更新优化器
-
-        对于用户提供的初始数据，自动进行参数识别和优化。"""
-
-        agent = create_react_agent(
-            model,
-            tools=tool_node,
-            state_schema=GraphState,
-            checkpointer=checkpointer,
-            **create_react_agent_kwargs,
-        )
-
-        # 准备初始消息
-        messages = [("system", system_prompt), ("user", state["user_instructions"])]
-
-        response = agent.invoke(
-            {
-                "messages": messages,
-                "optimizer_state": state.get("optimizer_state", {}),
-                "current_suggestion": state.get("current_suggestion", []),
-                "confirmed_parameters": state.get("confirmed_parameters", False),
-                "optimization_goal": state.get("optimization_goal", ""),
-                "input_variables": state.get("input_variables", []),
-                "output_variable": state.get("output_variable", ""),
-                "variable_bounds": state.get("variable_bounds", {}),
-                "input_data": state.get("input_data", {}),
-                "auto_mode": state.get("auto_mode", False),
-                "user_confirmed_settings": state.get("user_confirmed_settings", False),
-            },
-            invoke_react_agent_kwargs,
-        )
-
-        print("    * 正在后处理优化结果")
-
-        internal_messages = response['messages']
-
-        # 处理结果
-        last_ai_message = AIMessage(internal_messages[-1].content, role=AGENT_NAME)
-
-        # 提取优化结果
-        optimization_results = response.get("optimization_results", {})
-        tool_calls = get_tool_call_names(internal_messages)
-
-        return {
-            "messages": [last_ai_message],
-            "internal_messages": internal_messages,
-            "optimization_results": optimization_results,
-            "tool_calls": tool_calls,
-            "optimizer_state": response.get("optimizer_state", {}),
-            "current_suggestion": response.get("current_suggestion", []),
-            "confirmed_parameters": response.get("confirmed_parameters", False),
-            "optimization_goal": response.get("optimization_goal", ""),
-            "input_variables": response.get("input_variables", []),
-            "output_variable": response.get("output_variable", ""),
-            "variable_bounds": response.get("variable_bounds", {}),
-            "input_data": response.get("input_data", {}),
-            "auto_mode": response.get("auto_mode", False),
-            "user_confirmed_settings": response.get("user_confirmed_settings", False),
+    def __init__(self, model: Any):
+        self.model = model
+        self.workflow = create_bayesian_optimization_agent(model)
+        self.state = {
+            "messages": [],
+            "user_instructions": "",
+            "input_variables": [],
+            "output_variable": "",
+            "optimization_goal": "",
+            "variable_bounds": {},
+            "input_data": None,
+            "optimizer_state": None,
+            "current_suggestion": None,
+            "optimization_results": [],
+            "confirmed_settings": False,
+            "step": "setup",
+            "need_human_approval": False
         }
 
-    workflow = StateGraph(GraphState)
+    def run(self, input_data: Dict[str, Any] = None):
+        """运行优化流程"""
+        if input_data:
+            self.state["input_data"] = input_data
 
-    workflow.add_node("bayesian_optimization_agent", bayesian_optimization_agent)
+        # 执行工作流
+        self.state = self.workflow.invoke(self.state)
+        return self.state
 
-    workflow.add_edge(START, "bayesian_optimization_agent")
-    workflow.add_edge("bayesian_optimization_agent", END)
+    def get_optimization_results(self):
+        """获取优化结果"""
+        return self.state["optimization_results"]
 
-    app = workflow.compile(
-        checkpointer=checkpointer,
-        name=AGENT_NAME,
-    )
+    def get_best_result(self):
+        """获取最佳结果"""
+        if not self.state["optimization_results"]:
+            return None
 
-    return app
+        if self.state["optimization_goal"] == "maximize":
+            return max(self.state["optimization_results"], key=lambda x: x["result"])
+        else:
+            return min(self.state["optimization_results"], key=lambda x: x["result"])
 
 
-# 测试函数
 def test_bayesian_optimization():
     """测试贝叶斯优化功能"""
     # 创建测试数据
     np.random.seed(42)
-    X = np.random.rand(10, 2)  # 10个样本，2个特征
-    Y = np.sin(X[:, 0]) + np.cos(X[:, 1]) + np.random.normal(0, 0.1, 10)  # 简单的目标函数
+    data = np.random.rand(20, 5)
+    target = np.sin(data[:, 0]) + np.cos(data[:, 1]) + np.random.normal(0, 0.1, 20)
 
+    df = pd.DataFrame(data, columns=['特征1', '特征2', '特征3', '特征4', '特征5'])
+    df['目标值'] = target
+
+    print("生成的测试数据:")
+    print(df.head())
+    print(f"\n数据形状: {df.shape}")
+
+    # 初始化模型
     from langchain_openai import ChatOpenAI
 
-    load_dotenv()
-
     llm = ChatOpenAI(
-        model="deepseek-chat",
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE"),
+        model="gpt-3.5-turbo",
         temperature=0.0,
         max_tokens=500
     )
@@ -529,27 +526,13 @@ def test_bayesian_optimization():
     # 创建优化代理
     agent = BayesianOptimizationAgent(llm)
 
-    # 运行优化
-    test_query = "使用提供的数据进行贝叶斯优化，目标是找到最佳参数组合"
+    # 提取数据
+    X = df[['特征1', '特征2']].values
+    Y = df['目标值'].values
 
-    print("\n开始优化过程...")
-    agent.invoke_agent(
-        user_instructions=test_query,
-        input_data={"X": X, "Y": Y}
-    )
-
-    # 获取结果
-    print("\n优化结果:")
-    results = agent.get_optimization_results()
-    print("优化记录:", results)
-
-    # 显示最佳结果
-    if results and len(results) > 0:
-        best_result = max(results, key=lambda x: x['result']) if len(results) > 0 else None
-        print(f"\n最佳参数组合: {best_result['parameters']}")
-        print(f"最佳结果值: {best_result['result']}")
-
-    return agent
+    # 运行优化流程
+    print("\n开始贝叶斯优化流程...")
+    agent.run({"X": X, "Y": Y})
 
 
 if __name__ == '__main__':
