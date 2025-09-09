@@ -714,7 +714,7 @@ def make_data_cleaning_agent(
         human_review_node_name="human_review",
         checkpointer=checkpointer,
         bypass_recommended_steps=bypass_recommended_steps,
-        bypass_explain_code=bypass_explain_code,
+        bypass_explain_code=True,  # Set to True since we're using report_agent_outputs instead
         agent_name=AGENT_NAME,
     )
 

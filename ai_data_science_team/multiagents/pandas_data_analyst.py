@@ -13,7 +13,8 @@ import json
 from IPython.display import Markdown
 
 from ai_data_science_team.templates import BaseAgent
-from ai_data_science_team.agents import DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent, BayesianOptimizationAgent
+from ai_data_science_team.agents import DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent
+from ai_data_science_team.agents.bayesian_optimization_agent import BayesianOptimizationAgent
 from ai_data_science_team.utils.plotly import plotly_from_dict
 from ai_data_science_team.utils.regex import remove_consecutive_duplicates, get_generic_summary
 
@@ -22,7 +23,7 @@ AGENT_NAME = "pandas_data_analyst"
 
 class PandasDataAnalyst(BaseAgent):
     """
-    PandasDataAnalyst is a multi-agent class that combines data wrangling and visualization capabilities.
+    PandasDataAnalyst is a multi-agent class that combines data wrangling, visualization, and optimization capabilities.
 
     Parameters:
     -----------
@@ -34,6 +35,8 @@ class PandasDataAnalyst(BaseAgent):
         The Data Visualization Agent for generating plots.
     data_cleaning_agent: DataCleaningAgent
         The Data Cleaning Agent for cleaning data.
+    bayesian_opt_agent: BayesianOptimizationAgent
+        The Bayesian Optimization Agent for parameter optimization and hyperparameter tuning.
     checkpointer: Checkpointer (optional)
         The checkpointer to save the state of the multi-agent system.
 
@@ -51,6 +54,10 @@ class PandasDataAnalyst(BaseAgent):
         Returns the data wrangling function as a string, optionally in Markdown.
     get_data_visualization_function(markdown=False)
         Returns the data visualization function as a string, optionally in Markdown.
+    get_bayesian_optimization_results()
+        Returns the bayesian optimization results.
+    get_bayesian_optimization_function(markdown=False)
+        Returns the bayesian optimization function as a string, optionally in Markdown.
     """
 
     def __init__(
@@ -67,7 +74,7 @@ class PandasDataAnalyst(BaseAgent):
             "data_wrangling_agent": data_wrangling_agent,
             "data_visualization_agent": data_visualization_agent,
             "data_cleaning_agent": data_cleaning_agent,
-            "bayesian_opt_agent": bayesian_opt_agent ,
+            "bayesian_opt_agent": bayesian_opt_agent,
             "checkpointer": checkpointer,
         }
         self._compiled_graph = self._make_compiled_graph()
@@ -139,6 +146,17 @@ class PandasDataAnalyst(BaseAgent):
             code = self.response.get("data_visualization_function")
             return Markdown(f"```python\n{code}\n```") if markdown else code
 
+    def get_bayesian_optimization_results(self):
+        """Returns the bayesian optimization results."""
+        if self.response and self.response.get("bayesian_opt_results"):
+            return self.response.get("bayesian_opt_results")
+
+    def get_bayesian_optimization_function(self, markdown=False):
+        """Returns the bayesian optimization function as a string."""
+        if self.response and self.response.get("bayesian_opt_function"):
+            code = self.response.get("bayesian_opt_function")
+            return Markdown(f"```python\n{code}\n```") if markdown else code
+
     def get_workflow_summary(self, markdown=False):
         """Returns a summary of the workflow."""
         if self.response and self.response.get("messages"):
@@ -171,15 +189,19 @@ def make_pandas_data_analyst(
         checkpointer: Checkpointer = None
 ):
     """
-    Creates a multi-agent system that wrangles data and optionally visualizes it.
+    Creates a multi-agent system that wrangles data, visualizes it, and performs optimization.
 
     Parameters:
     -----------
     model: The language model to be used.
+    data_cleaning_agent: CompiledStateGraph
+        The Data Cleaning Agent.
     data_wrangling_agent: CompiledStateGraph
         The Data Wrangling Agent.
     data_visualization_agent: CompiledStateGraph
         The Data Visualization Agent.
+    bayesian_opt_agent: CompiledStateGraph
+        The Bayesian Optimization Agent.
     checkpointer: Checkpointer (optional)
         The checkpointer to save the state.
 
@@ -199,18 +221,21 @@ def make_pandas_data_analyst(
         2. Pandas Data Wrangling Agent - handles data manipulation, transformation, and analysis
         3. Data Visualization Agent - creates charts and visualizations
         4. Data Analysis Agent - performs advanced statistical analysis and insights
+        5. Bayesian Optimization Agent - handles parameter optimization, hyperparameter tuning, and finding optimal values
 
         Routing rules:
         - For data cleaning, missing values, outliers, data quality: route to Data Cleaning Agent FIRST
         - For data transformation, filtering, aggregation: route to Data Wrangling Agent
         - For charts, graphs, visualizations: route to Visualization Agent
         - For statistical analysis, trends, patterns: route to Data Analysis Agent
+        - For optimization, parameter tuning, finding best values, hyperparameter optimization: route to Bayesian Optimization Agent
 
         Return JSON with:
         - 'user_instructions_data_cleaning': instructions for cleaning agent (if applicable)
         - 'user_instructions_data_wrangling': instructions for wrangling agent (if applicable)
         - 'user_instructions_data_visualization': instructions for visualization agent (if applicable)
         - 'user_instructions_data_analysis': instructions for analysis agent (if applicable)
+        - 'user_instructions_bayesian_opt': instructions for bayesian optimization agent (if applicable)
         - 'routing_preprocessor_decision': ordered list of agents to invoke
 
         INITIAL_USER_QUESTION: {user_instructions}
@@ -227,6 +252,7 @@ def make_pandas_data_analyst(
         user_instructions_data_wrangling: str
         user_instructions_data_visualization: str
         user_instructions_data_analysis: str
+        user_instructions_bayesian_opt: str
         routing_preprocessor_decision: list
         data_raw: Union[dict, list]
         data_cleaned: dict
@@ -236,6 +262,8 @@ def make_pandas_data_analyst(
         data_visualization_function: str
         data_analysis_results: dict
         data_analysis_function: str
+        bayesian_opt_results: dict
+        bayesian_opt_function: str
         plotly_graph: dict
         plotly_error: str
         max_retries: int
@@ -281,6 +309,7 @@ def make_pandas_data_analyst(
 
         agent_mapping = {
             "data_visualization_agent": "chart",
+            "bayesian_optimization_agent": "bayesian_opt",
         }
 
         return agent_mapping.get(current_agent, "table")
@@ -336,6 +365,26 @@ def make_pandas_data_analyst(
             "data_cleaning_function": response.get("data_cleaning_function"),
         }
 
+    def invoke_bayesian_optimization_agent(state: PrimaryState):
+        """Invoke the bayesian optimization agent for parameter optimization"""
+        print("---INVOKING BAYESIAN OPTIMIZATION AGENT---")
+
+        # Use wrangled data if available, otherwise use raw data
+        data_to_use = state.get("data_wrangled") if state.get("data_wrangled") else state.get("data_raw")
+
+        response = bayesian_opt_agent.invoke({
+            "user_instructions": state.get("user_instructions_bayesian_opt"),
+            "data_raw": data_to_use,
+            "max_retries": state.get("max_retries"),
+            "retry_count": state.get("retry_count"),
+        })
+
+        return {
+            "messages": response.get("messages"),
+            "bayesian_opt_results": response.get("optimization_results"),
+            "bayesian_opt_function": response.get("optimization_function"),
+        }
+
     def route_printer(state: PrimaryState):
         print("---ROUTE PRINTER---")
         print(f"    Route: {state.get('routing_preprocessor_decision')}")
@@ -348,6 +397,7 @@ def make_pandas_data_analyst(
     workflow.add_node("data_cleaning_agent", invoke_data_cleaning_agent)
     workflow.add_node("data_wrangling_agent", invoke_data_wrangling_agent)
     workflow.add_node("data_visualization_agent", invoke_data_visualization_agent)
+    workflow.add_node("bayesian_optimization_agent", invoke_bayesian_optimization_agent)
     workflow.add_node("route_printer", route_printer)
 
     workflow.add_edge(START, "routing_preprocessor")
@@ -359,11 +409,13 @@ def make_pandas_data_analyst(
         router_agents,
         {
             "chart": "data_visualization_agent",
+            "bayesian_opt": "bayesian_optimization_agent",
             "table": "route_printer"
         }
     )
 
     workflow.add_edge("data_visualization_agent", "route_printer")
+    workflow.add_edge("bayesian_optimization_agent", "route_printer")
     workflow.add_edge("route_printer", END)
 
     app = workflow.compile(

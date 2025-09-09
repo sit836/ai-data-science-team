@@ -134,9 +134,9 @@ class BaseAgent(CompiledStateGraph):
     
     def stream(
         self,
-        input: dict[str, Any] | Any,
-        config: RunnableConfig | None = None,
-        stream_mode: StreamMode | list[StreamMode] | None = None, 
+        input: Union[Dict[str, Any], Any],
+        config: Optional[RunnableConfig] = None,
+        stream_mode: Union[StreamMode, List[StreamMode], None] = None, 
         **kwargs
     ):
         """
@@ -165,9 +165,9 @@ class BaseAgent(CompiledStateGraph):
     
     async def astream(
         self,
-        input: dict[str, Any] | Any,
-        config: RunnableConfig | None = None,
-        stream_mode: StreamMode | list[StreamMode] | None = None, 
+        input: Union[Dict[str, Any], Any],
+        config: Optional[RunnableConfig] = None,
+        stream_mode: Union[StreamMode, List[StreamMode], None] = None, 
         **kwargs
     ):
         """
@@ -345,6 +345,10 @@ def create_coding_agent_graph(
     if not bypass_explain_code:
         workflow.add_node(explain_code_node_name, node_functions[explain_code_node_name])
     
+    # Add report_agent_outputs node if it exists in node_functions (for human review)
+    if "report_agent_outputs" in node_functions:
+        workflow.add_node("report_agent_outputs", node_functions["report_agent_outputs"])
+    
     # * EDGES
     
     # Set the entry point
@@ -400,6 +404,10 @@ def create_coding_agent_graph(
             
     if not bypass_explain_code:
         workflow.add_edge(explain_code_node_name, END)
+    
+    # Add edge from report_agent_outputs to END if it exists
+    if "report_agent_outputs" in node_functions:
+        workflow.add_edge("report_agent_outputs", END)
     
     # Finally, compile
     app = workflow.compile(

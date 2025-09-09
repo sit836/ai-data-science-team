@@ -8,8 +8,8 @@ from langchain.tools import tool
 @tool(response_format='content_and_artifact')
 def mlflow_search_experiments(
     filter_string: Optional[str] = None,
-    tracking_uri: str | None = None,
-    registry_uri: str | None = None
+    tracking_uri: Optional[str] = None,
+    registry_uri: Optional[str] = None
 ) -> str:
     """
     Search and list existing MLflow experiments.
@@ -59,8 +59,8 @@ def mlflow_search_experiments(
 def mlflow_search_runs(
     experiment_ids: Optional[Union[List[str], List[int], str, int]] = None,
     filter_string: Optional[str] = None,
-    tracking_uri: str | None = None,
-    registry_uri: str | None = None
+    tracking_uri: Optional[str] = None,
+    registry_uri: Optional[str] = None
 ) -> str:
     """
     Search runs within one or more MLflow experiments, optionally filtering by a filter_string.
