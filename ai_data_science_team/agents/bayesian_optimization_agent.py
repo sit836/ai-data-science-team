@@ -43,14 +43,27 @@ class BayesianOptimizer:
         """拟合高斯过程"""
         kernel = ConstantKernel(1.0) * RBF(length_scale=1.0)
         self.gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
-        self.gp.fit(np.array(self.X), np.array(self.y))
+        
+        # 确保 X 是二维数组 (n_samples, n_features)
+        X_array = np.array(self.X)
+        if X_array.ndim == 1:
+            X_array = X_array.reshape(-1, 1)
+        
+        self.gp.fit(X_array, np.array(self.y))
 
     def acquisition_function(self, x, xi=0.01):
         """获取函数（预期改进）"""
         if len(self.y) == 0:
             return 0
 
-        x = np.array(x).reshape(1, -1)
+        # 确保 x 是正确的格式
+        x = np.array(x)
+        if x.ndim == 0:  # 标量
+            x = x.reshape(1, 1)
+        elif x.ndim == 1:  # 一维数组
+            x = x.reshape(1, -1)
+        # 如果已经是二维数组，保持不变
+        
         mu, sigma = self.gp.predict(x, return_std=True)
 
         if sigma == 0:
@@ -303,6 +316,10 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
             for var in missing_bounds:
                 state["variable_bounds"][var] = (0.0, 1.0)
 
+        # 确保 optimization_results 已初始化
+        if "optimization_results" not in state:
+            state["optimization_results"] = []
+
         return state
 
     def optimization_node(state: AgentState):
@@ -323,9 +340,28 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
             if state.get("input_data") and "X" in state["input_data"] and "Y" in state["input_data"]:
                 X_data = state["input_data"]["X"]
                 Y_data = state["input_data"]["Y"]
+                columns = state["input_data"].get("columns", [])
+                
                 if len(X_data) > 0 and len(Y_data) > 0:
                     if hasattr(Y_data, 'shape') and len(Y_data.shape) > 1:
                         Y_data = Y_data.flatten()
+                    
+                    # 只选择用户指定的输入变量对应的特征
+                    if columns and state.get("input_variables"):
+                        # 找到用户选择的特征在原始数据中的索引
+                        feature_indices = []
+                        for var in state["input_variables"]:
+                            if var in columns:
+                                feature_indices.append(columns.index(var))
+                        
+                        if feature_indices:
+                            # 只提取选中的特征
+                            if hasattr(X_data, 'shape') and len(X_data.shape) > 1:
+                                X_data = X_data[:, feature_indices]
+                            else:
+                                # 如果是列表格式，需要重新构建
+                                X_data = [[row[i] for i in feature_indices] for row in X_data]
+                    
                     # 确保数据类型正确
                     if hasattr(X_data, 'tolist'):
                         X_list = X_data.tolist()
@@ -559,6 +595,7 @@ class BayesianOptimizationAgent(BaseAgent):
             "user_instructions": user_instructions,
             "input_data": input_data,
             "max_iterations": max_iterations,
+            "optimization_results": [],
         }, **kwargs)
         self.response = response
         return None
@@ -593,6 +630,7 @@ class BayesianOptimizationAgent(BaseAgent):
             "user_instructions": user_instructions,
             "input_data": input_data,
             "max_iterations": max_iterations,
+            "optimization_results": [],
         }, **kwargs)
         self.response = response
         return None
