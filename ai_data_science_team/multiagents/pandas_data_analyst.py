@@ -15,6 +15,7 @@ from IPython.display import Markdown
 from ai_data_science_team.templates import BaseAgent
 from ai_data_science_team.agents import DataWranglingAgent, DataVisualizationAgent, DataCleaningAgent
 from ai_data_science_team.agents.bayesian_optimization_agent import BayesianOptimizationAgent
+from ai_data_science_team.agents.interactive_data_cleaning_agent import InteractiveDataCleaningAgent
 from ai_data_science_team.utils.plotly import plotly_from_dict
 from ai_data_science_team.utils.regex import remove_consecutive_duplicates, get_generic_summary
 
@@ -35,6 +36,8 @@ class PandasDataAnalyst(BaseAgent):
         The Data Visualization Agent for generating plots.
     data_cleaning_agent: DataCleaningAgent
         The Data Cleaning Agent for cleaning data.
+    interactive_data_cleaning_agent: InteractiveDataCleaningAgent
+        The Interactive Data Cleaning Agent for interactive data cleaning with user confirmation.
     bayesian_opt_agent: BayesianOptimizationAgent
         The Bayesian Optimization Agent for parameter optimization and hyperparameter tuning.
     checkpointer: Checkpointer (optional)
@@ -66,6 +69,7 @@ class PandasDataAnalyst(BaseAgent):
             data_wrangling_agent: DataWranglingAgent,
             data_visualization_agent: DataVisualizationAgent,
             data_cleaning_agent: DataCleaningAgent,
+            interactive_data_cleaning_agent: InteractiveDataCleaningAgent,
             bayesian_opt_agent: BayesianOptimizationAgent,
             checkpointer: Checkpointer = None,
     ):
@@ -74,6 +78,7 @@ class PandasDataAnalyst(BaseAgent):
             "data_wrangling_agent": data_wrangling_agent,
             "data_visualization_agent": data_visualization_agent,
             "data_cleaning_agent": data_cleaning_agent,
+            "interactive_data_cleaning_agent": interactive_data_cleaning_agent,
             "bayesian_opt_agent": bayesian_opt_agent,
             "checkpointer": checkpointer,
         }
@@ -86,6 +91,7 @@ class PandasDataAnalyst(BaseAgent):
         return make_pandas_data_analyst(
             model=self._params["model"],
             data_cleaning_agent=self._params["data_cleaning_agent"]._compiled_graph,
+            interactive_data_cleaning_agent=self._params["interactive_data_cleaning_agent"]._compiled_graph,
             data_wrangling_agent=self._params["data_wrangling_agent"]._compiled_graph,
             data_visualization_agent=self._params["data_visualization_agent"]._compiled_graph,
             bayesian_opt_agent=self._params["bayesian_opt_agent"]._compiled_graph,
@@ -183,6 +189,7 @@ class PandasDataAnalyst(BaseAgent):
 def make_pandas_data_analyst(
         model,
         data_cleaning_agent: CompiledStateGraph,
+        interactive_data_cleaning_agent: CompiledStateGraph,
         data_wrangling_agent: CompiledStateGraph,
         data_visualization_agent: CompiledStateGraph,
         bayesian_opt_agent: CompiledStateGraph,
@@ -196,6 +203,8 @@ def make_pandas_data_analyst(
     model: The language model to be used.
     data_cleaning_agent: CompiledStateGraph
         The Data Cleaning Agent.
+    interactive_data_cleaning_agent: CompiledStateGraph
+        The Interactive Data Cleaning Agent.
     data_wrangling_agent: CompiledStateGraph
         The Data Wrangling Agent.
     data_visualization_agent: CompiledStateGraph
@@ -217,14 +226,16 @@ def make_pandas_data_analyst(
         You are an expert in routing decisions for a multi-agent system. Your job is to determine which agent(s) should handle the user's request:
 
         Available agents:
-        1. Data Cleaning Agent - handles data cleaning, missing value handling, outlier detection
-        2. Pandas Data Wrangling Agent - handles data manipulation, transformation, and analysis
-        3. Data Visualization Agent - creates charts and visualizations
-        4. Data Analysis Agent - performs advanced statistical analysis and insights
-        5. Bayesian Optimization Agent - handles parameter optimization, hyperparameter tuning, and finding optimal values
+        1. Data Cleaning Agent - handles automatic data cleaning, missing value handling, outlier detection
+        2. Interactive Data Cleaning Agent - handles interactive data cleaning with user confirmation and custom solutions
+        3. Pandas Data Wrangling Agent - handles data manipulation, transformation, and analysis
+        4. Data Visualization Agent - creates charts and visualizations
+        5. Data Analysis Agent - performs advanced statistical analysis and insights
+        6. Bayesian Optimization Agent - handles parameter optimization, hyperparameter tuning, and finding optimal values
 
         Routing rules:
-        - For data cleaning, missing values, outliers, data quality: route to Data Cleaning Agent FIRST
+        - For interactive data cleaning, user confirmation needed, custom cleaning solutions: route to Interactive Data Cleaning Agent FIRST
+        - For automatic data cleaning, missing values, outliers, data quality: route to Data Cleaning Agent
         - For data transformation, filtering, aggregation: route to Data Wrangling Agent
         - For charts, graphs, visualizations: route to Visualization Agent
         - For statistical analysis, trends, patterns: route to Data Analysis Agent
@@ -232,6 +243,7 @@ def make_pandas_data_analyst(
 
         Return JSON with:
         - 'user_instructions_data_cleaning': instructions for cleaning agent (if applicable)
+        - 'user_instructions_interactive_data_cleaning': instructions for interactive cleaning agent (if applicable)
         - 'user_instructions_data_wrangling': instructions for wrangling agent (if applicable)
         - 'user_instructions_data_visualization': instructions for visualization agent (if applicable)
         - 'user_instructions_data_analysis': instructions for analysis agent (if applicable)
@@ -249,6 +261,7 @@ def make_pandas_data_analyst(
         messages: Annotated[Sequence[BaseMessage], operator.add]
         user_instructions: str
         user_instructions_data_cleaning: str
+        user_instructions_interactive_data_cleaning: str
         user_instructions_data_wrangling: str
         user_instructions_data_visualization: str
         user_instructions_data_analysis: str
@@ -282,6 +295,7 @@ def make_pandas_data_analyst(
             "user_instructions_data_wrangling": response.get('user_instructions_data_wrangling'),
             "user_instructions_data_visualization": response.get('user_instructions_data_visualization'),
             "user_instructions_data_cleaning": response.get('user_instructions_data_cleaning'),
+            "user_instructions_interactive_data_cleaning": response.get('user_instructions_interactive_data_cleaning'),
             "user_instructions_bayesian_opt": response.get('user_instructions_bayesian_opt'),
             "routing_preprocessor_decision": response.get('routing_preprocessor_decision'),
         }
@@ -291,15 +305,19 @@ def make_pandas_data_analyst(
         print("---ROUTER: AGENT SELECTION---")
         agents_to_invoke = state.get('routing_preprocessor_decision', [])
 
-        # Check if we need to start with cleaning
-        if "cleaning" in agents_to_invoke and not state.get("data_cleaned"):
+        # Check if we need to start with interactive cleaning
+        if "interactive_data_cleaning_agent" in agents_to_invoke and not state.get("data_cleaned"):
+            return "interactive_cleaning"
+        
+        # Check if we need to start with regular cleaning
+        if "data_cleaning_agent" in agents_to_invoke and not state.get("data_cleaned"):
             return "cleaning"
 
         # After cleaning, proceed to next agent
         current_agent = None
-        if "cleaning" in agents_to_invoke and state.get("data_cleaned"):
-            # Remove cleaning from list and get next agent
-            remaining_agents = [agent for agent in agents_to_invoke if agent != "cleaning"]
+        if ("cleaning" in agents_to_invoke or "interactive_data_cleaning_agent" in agents_to_invoke) and state.get("data_cleaned"):
+            # Remove cleaning agents from list and get next agent
+            remaining_agents = [agent for agent in agents_to_invoke if agent not in ["cleaning", "data_cleaning_agent", "interactive_data_cleaning_agent"]]
             if remaining_agents:
                 current_agent = remaining_agents[0]
 
@@ -365,6 +383,23 @@ def make_pandas_data_analyst(
             "data_cleaning_function": response.get("data_cleaning_function"),
         }
 
+    def invoke_interactive_data_cleaning_agent(state: PrimaryState):
+        """Invoke the interactive data cleaning agent to clean raw data with user confirmation"""
+        print("---INVOKING INTERACTIVE DATA CLEANING AGENT---")
+
+        response = interactive_data_cleaning_agent.invoke({
+            "user_instructions": state.get("user_instructions_interactive_data_cleaning"),
+            "data_raw": state.get("data_raw"),
+            "max_retries": state.get("max_retries"),
+            "retry_count": state.get("retry_count"),
+        })
+
+        return {
+            "messages": response.get("messages"),
+            "data_cleaned": response.get("data_cleaned"),
+            "data_cleaning_function": response.get("data_cleaner_function"),
+        }
+
     def invoke_bayesian_optimization_agent(state: PrimaryState):
         """Invoke the bayesian optimization agent for parameter optimization"""
         print("---INVOKING BAYESIAN OPTIMIZATION AGENT---")
@@ -395,6 +430,7 @@ def make_pandas_data_analyst(
 
     workflow.add_node("routing_preprocessor", preprocess_routing)
     workflow.add_node("data_cleaning_agent", invoke_data_cleaning_agent)
+    workflow.add_node("interactive_data_cleaning_agent", invoke_interactive_data_cleaning_agent)
     workflow.add_node("data_wrangling_agent", invoke_data_wrangling_agent)
     workflow.add_node("data_visualization_agent", invoke_data_visualization_agent)
     workflow.add_node("bayesian_optimization_agent", invoke_bayesian_optimization_agent)
@@ -406,6 +442,18 @@ def make_pandas_data_analyst(
 
     workflow.add_conditional_edges(
         "data_cleaning_agent",
+        router_agents,
+        {
+            "interactive_cleaning": "interactive_data_cleaning_agent",
+            "cleaning": "data_cleaning_agent",
+            "chart": "data_visualization_agent",
+            "bayesian_opt": "bayesian_optimization_agent",
+            "table": "route_printer"
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "interactive_data_cleaning_agent",
         router_agents,
         {
             "chart": "data_visualization_agent",
