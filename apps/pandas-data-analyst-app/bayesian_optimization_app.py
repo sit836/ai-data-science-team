@@ -15,6 +15,7 @@ from langchain_community.chat_message_histories import StreamlitChatMessageHisto
 from langchain_openai import ChatOpenAI
 from typing import Dict, List, Any, Optional
 import time
+import asyncio
 
 from ai_data_science_team.agents.bayesian_optimization_agent import BayesianOptimizationAgent
 import re
@@ -106,10 +107,14 @@ class DataCleaningHandler:
 当前处理类型: {processing_type}
 
 请判断用户的意图：
-1. agree - 用户同意当前方案，要求继续处理
-2. disagree - 用户不同意当前方案，要求取消处理  
-3. question - 用户提出问题或需要解释
-4. custom_solution - 用户提出了自定义的处理方案
+1. agree - 用户同意当前方案，要求继续处理（如：继续、开始、同意、好的等）
+2. disagree - 用户不同意当前方案，要求取消处理（如：不、不要、取消等）
+3. question - 用户提出问题或需要解释（如：为什么、如何、什么等）
+4. custom_solution - 用户提出了自定义的处理方案（如：用0补、用平均值填充、删除重复行等）
+
+特别注意：
+- 如果用户输入包含具体的处理方法（如"用0补"、"用平均值"、"删除重复"等），应识别为custom_solution
+- 如果用户只是简单同意或继续，应识别为agree
 
 如果是自定义方案，请提取方案的核心内容。
 
@@ -118,7 +123,8 @@ class DataCleaningHandler:
 示例：
 agree|
 question|
-custom_solution|使用平均值填充缺失值"""
+custom_solution|用0填充缺失值
+custom_solution|删除重复行"""
 
         try:
             response = self.llm.invoke(intent_prompt)
@@ -148,14 +154,15 @@ custom_solution|使用平均值填充缺失值"""
         # 简单的关键词匹配（仅在LLM不可用时使用）
         agree_keywords = ['继续', '开始', '同意', '好的', '没问题', 'ok', 'yes', 'y', '是']
         disagree_keywords = ['不', '不要', '取消', '停止', '退出', 'no', 'n', '拒绝', '不同意']
-        custom_keywords = ['用', '填充', '删除', '保留', '处理', '方案']
+        custom_keywords = ['用', '填充', '删除', '保留', '处理', '方案', '补', '0', '平均值', '中位数', '众数']
 
-        if any(keyword in user_input_lower for keyword in agree_keywords):
+        # 优先检查自定义方案关键词
+        if any(keyword in user_input_lower for keyword in custom_keywords):
+            return "custom_solution"
+        elif any(keyword in user_input_lower for keyword in agree_keywords):
             return "agree"
         elif any(keyword in user_input_lower for keyword in disagree_keywords):
             return "disagree"
-        elif any(keyword in user_input_lower for keyword in custom_keywords):
-            return "custom_solution"
         else:
             return "question"
     
@@ -214,6 +221,41 @@ custom_solution|使用平均值填充缺失值"""
 
         # 生成回答失败时的降级处理
         return self.get_fallback_response(processing_type, user_input, processing_details)
+    
+    def llm_generate_response_streaming(self, user_input: str, processing_type: str, messages: List[Dict], 
+                                       processing_details: Dict, placeholder):
+        """流式生成LLM回答"""
+        # 构建对话上下文
+        conversation_context = "\n".join([
+            f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+            for msg in messages[-3:]  # 最近3条消息
+        ])
+        
+        prompt = f"""作为数据清洗助手，请根据对话历史生成友好、专业的回答。
+
+对话历史：
+{conversation_context}
+
+当前处理类型: {processing_type}
+处理详情: {processing_details}
+用户最新输入: "{user_input}"
+
+请生成友好、专业的回答，帮助用户理解处理方案："""
+
+        try:
+            # 使用流式输出
+            full_response = ""
+            for chunk in self.llm.stream(prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    full_response += chunk.content
+                    placeholder.markdown(f"**AI:** {full_response}")
+                    time.sleep(0.05)  # 控制输出速度
+            
+            return full_response
+        except Exception as e:
+            print(f"❌ LLM流式回答生成错误: {e}")
+            # 降级到非流式
+            return self.llm_generate_response_with_fallback(user_input, processing_type, messages, processing_details)
     
     def llm_generate_response(self, user_input: str, processing_type: str, messages: List[Dict],
                               processing_details: Dict) -> str:
@@ -355,32 +397,209 @@ class MissingValueHandler:
 
         return df
     
-    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
-        """应用用户自定义的缺失值处理方案"""
+    def apply_custom_solution_streaming(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict, placeholder) -> pd.DataFrame:
+        """流式执行用户自定义的缺失值处理方案"""
         try:
-            execution_prompt = f"""请解析并执行以下缺失值处理方案：
+            # 获取缺失值信息
+            missing_info = df.isnull().sum()
+            missing_columns = missing_info[missing_info > 0]
+            
+            show_loading_indicator("🤖 AI正在分析您的需求并生成处理代码...")
+            
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理缺失值。
 
 数据集信息:
-- 形状: {df.shape}
+- 数据形状: {df.shape}
 - 列名: {list(df.columns)}
-- 缺失列详情: {processing_details}
+- 缺失值统计: {missing_info.to_dict()}
+- 有缺失值的列: {list(missing_columns.index) if len(missing_columns) > 0 else '无'}
 
-自定义方案: "{custom_solution}"
+用户要求: "{custom_solution}"
 
-请生成Python代码来执行这个方案，只返回代码部分："""
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理所有缺失值
+4. 可以使用 pandas 和 numpy 库
 
-            response = self.cleaning_handler.llm.invoke(execution_prompt)
-            code = response.content.strip()
+示例代码格式：
+df = df.fillna(0)  # 用0填充所有缺失值
+# 或者针对特定列：
+# df['column_name'] = df['column_name'].fillna(0)
+
+请生成代码："""
+
+            # 使用流式输出生成代码
+            full_response = ""
+            for chunk in self.cleaning_handler.llm.stream(execution_prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    full_response += chunk.content
+                    placeholder.markdown(f"**AI正在生成代码:**\n```python\n{full_response}\n```")
+                    time.sleep(0.05)
+            
+            code = full_response.strip()
+            
+            # 清理代码，移除可能的markdown标记和解释文字
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            if not code:
+                placeholder.error("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            placeholder.success(f"✅ 代码生成完成！\n\n**生成的代码:**\n```python\n{code}\n```")
+            
+            # 显示更明显的提示，让用户有时间阅读代码
+            st.markdown("""
+            <div style="
+                background: linear-gradient(45deg, #00b894, #00a085);
+                color: white;
+                padding: 15px 20px;
+                border-radius: 10px;
+                margin: 10px 0;
+                text-align: center;
+                font-weight: bold;
+                font-size: 16px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            ">
+                📋 请查看上方生成的代码，系统将在3秒后自动执行...
+            </div>
+            """, unsafe_allow_html=True)
+            
+            time.sleep(3)  # 给用户时间阅读代码
+            
+            show_loading_indicator("🔧 正在执行代码处理数据...")
+
+            # 调试：显示执行前的数据样本
+            print(f"🔧 缺失值处理 - 代码执行前数据样本:")
+            print(f"   - 数据形状: {df.shape}")
+            print(f"   - 缺失值位置: {df.isnull().sum().sum()}")
+            print(f"   - 数据样本:\n{df.head()}")
+            print(f"   - 生成的代码: {code}")
 
             # 安全地执行代码
             local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
             exec(code, {}, local_vars)
 
             result_df = local_vars['df']
+            
+            # 调试：显示执行后的数据样本
+            print(f"🔧 缺失值处理 - 代码执行后数据样本:")
+            print(f"   - 数据形状: {result_df.shape}")
+            print(f"   - 缺失值位置: {result_df.isnull().sum().sum()}")
+            print(f"   - 数据样本:\n{result_df.head()}")
+            
+            # 验证结果
+            original_missing = df.isnull().sum().sum()
+            remaining_missing = result_df.isnull().sum().sum()
+            
+            placeholder.success(f"🎉 处理完成！\n\n**处理结果:**\n- 处理前缺失值: {original_missing}\n- 处理后缺失值: {remaining_missing}")
+            
+            if remaining_missing > 0:
+                placeholder.warning(f"⚠️ 注意: 仍有 {remaining_missing} 个缺失值未处理")
+            
+            return result_df
+
+        except Exception as e:
+            placeholder.error(f"❌ 自定义方案执行失败: {e}")
+            placeholder.info("🔄 回退到建议方案")
+            return self.apply_suggested_solution(df, processing_details)
+    
+    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
+        """应用用户自定义的缺失值处理方案"""
+        try:
+            # 获取缺失值信息
+            missing_info = df.isnull().sum()
+            missing_columns = missing_info[missing_info > 0]
+            
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理缺失值。
+
+数据集信息:
+- 数据形状: {df.shape}
+- 列名: {list(df.columns)}
+- 缺失值统计: {missing_info.to_dict()}
+- 有缺失值的列: {list(missing_columns.index) if len(missing_columns) > 0 else '无'}
+
+用户要求: "{custom_solution}"
+
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理所有缺失值
+4. 可以使用 pandas 和 numpy 库
+
+示例代码格式：
+df = df.fillna(0)  # 用0填充所有缺失值
+# 或者针对特定列：
+# df['column_name'] = df['column_name'].fillna(0)
+
+请生成代码："""
+
+            response = self.cleaning_handler.llm.invoke(execution_prompt)
+            code = response.content.strip()
+            
+            # 清理代码，移除可能的markdown标记和解释文字
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    # 保留代码行，但移除注释
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            # 如果代码为空，使用默认处理
+            if not code:
+                print("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            print(f"🔧 执行用户自定义方案:")
+            print(f"用户要求: {custom_solution}")
+            print(f"生成代码: {code}")
+
+            # 安全地执行代码
+            local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
+            exec(code, {}, local_vars)
+
+            result_df = local_vars['df']
+            
+            # 验证结果
+            original_missing = df.isnull().sum().sum()
+            remaining_missing = result_df.isnull().sum().sum()
+            
+            print(f"✅ 处理完成:")
+            print(f"   - 处理前缺失值: {original_missing}")
+            print(f"   - 处理后缺失值: {remaining_missing}")
+            
+            if remaining_missing > 0:
+                print(f"⚠️ 注意: 仍有 {remaining_missing} 个缺失值未处理")
+            
             return result_df
 
         except Exception as e:
             print(f"❌ 自定义方案执行失败: {e}")
+            print("🔄 回退到建议方案")
             return self.apply_suggested_solution(df, processing_details)
 
 class DuplicateHandler:
@@ -414,28 +633,177 @@ class DuplicateHandler:
         """应用建议的重复值处理方案"""
         return df.drop_duplicates(keep='first')
     
-    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
-        """应用用户自定义的重复值处理方案"""
+    def apply_custom_solution_streaming(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict, placeholder) -> pd.DataFrame:
+        """流式执行用户自定义的重复值处理方案"""
         try:
-            execution_prompt = f"""请解析并执行以下重复值处理方案：
+            duplicate_count = df.duplicated().sum()
+            
+            show_loading_indicator("🤖 AI正在分析您的需求并生成处理代码...")
+            
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理重复值。
 
 数据集信息:
-- 形状: {df.shape}
+- 数据形状: {df.shape}
 - 列名: {list(df.columns)}
-- 重复行数: {processing_details.get('duplicate_count', 0)}
+- 重复行数: {duplicate_count}
 
-自定义方案: "{custom_solution}"
+用户要求: "{custom_solution}"
 
-请生成Python代码来执行这个方案，只返回代码部分："""
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理重复值
+4. 可以使用 pandas 库
 
-            response = self.cleaning_handler.llm.invoke(execution_prompt)
-            code = response.content.strip()
+示例代码格式：
+df = df.drop_duplicates()  # 删除所有重复行
+# 或者保留第一个：
+# df = df.drop_duplicates(keep='first')
+
+请生成代码："""
+
+            # 使用流式输出生成代码
+            full_response = ""
+            for chunk in self.cleaning_handler.llm.stream(execution_prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    full_response += chunk.content
+                    placeholder.markdown(f"**AI正在生成代码:**\n```python\n{full_response}\n```")
+                    time.sleep(0.05)
+            
+            code = full_response.strip()
+            
+            # 清理代码
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            if not code:
+                placeholder.error("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            placeholder.success(f"✅ 代码生成完成！\n\n**生成的代码:**\n```python\n{code}\n```")
+            
+            # 显示更明显的提示，让用户有时间阅读代码
+            st.markdown("""
+            <div style="
+                background: linear-gradient(45deg, #00b894, #00a085);
+                color: white;
+                padding: 15px 20px;
+                border-radius: 10px;
+                margin: 10px 0;
+                text-align: center;
+                font-weight: bold;
+                font-size: 16px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            ">
+                📋 请查看上方生成的代码，系统将在3秒后自动执行...
+            </div>
+            """, unsafe_allow_html=True)
+            
+            time.sleep(3)  # 给用户时间阅读代码
+            
+            show_loading_indicator("🔧 正在执行代码处理数据...")
 
             # 安全地执行代码
             local_vars = {'df': df.copy(), 'pd': pd}
             exec(code, {}, local_vars)
 
             result_df = local_vars['df']
+            
+            # 验证结果
+            original_duplicates = duplicate_count
+            remaining_duplicates = result_df.duplicated().sum()
+            
+            placeholder.success(f"🎉 处理完成！\n\n**处理结果:**\n- 处理前重复行: {original_duplicates}\n- 处理后重复行: {remaining_duplicates}")
+            
+            return result_df
+
+        except Exception as e:
+            placeholder.error(f"❌ 自定义方案执行失败: {e}")
+            placeholder.info("🔄 回退到建议方案")
+            return self.apply_suggested_solution(df, processing_details)
+    
+    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
+        """应用用户自定义的重复值处理方案"""
+        try:
+            duplicate_count = df.duplicated().sum()
+            
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理重复值。
+
+数据集信息:
+- 数据形状: {df.shape}
+- 列名: {list(df.columns)}
+- 重复行数: {duplicate_count}
+
+用户要求: "{custom_solution}"
+
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理重复值
+4. 可以使用 pandas 库
+
+示例代码格式：
+df = df.drop_duplicates()  # 删除所有重复行
+# 或者保留第一个：
+# df = df.drop_duplicates(keep='first')
+
+请生成代码："""
+
+            response = self.cleaning_handler.llm.invoke(execution_prompt)
+            code = response.content.strip()
+            
+            # 清理代码，移除可能的markdown标记和解释文字
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            if not code:
+                print("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            print(f"🔧 执行用户自定义方案:")
+            print(f"用户要求: {custom_solution}")
+            print(f"生成代码: {code}")
+
+            # 安全地执行代码
+            local_vars = {'df': df.copy(), 'pd': pd}
+            exec(code, {}, local_vars)
+
+            result_df = local_vars['df']
+            
+            # 验证结果
+            original_duplicates = duplicate_count
+            remaining_duplicates = result_df.duplicated().sum()
+            
+            print(f"✅ 处理完成:")
+            print(f"   - 处理前重复行: {original_duplicates}")
+            print(f"   - 处理后重复行: {remaining_duplicates}")
+            
             return result_df
 
         except Exception as e:
@@ -528,32 +896,219 @@ class OutlierHandler:
 
         return df
     
-    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
-        """应用用户自定义的异常值处理方案"""
+    def apply_custom_solution_streaming(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict, placeholder) -> pd.DataFrame:
+        """流式执行用户自定义的异常值处理方案"""
         try:
             numeric_cols = processing_details.get('numeric_cols', [])
             outlier_info = processing_details.get('outlier_info', {})
+            
+            # 计算异常值统计
+            outlier_stats = {}
+            for col in numeric_cols:
+                if col in df.columns:
+                    col_data = df[col].dropna()
+                    if len(col_data) > 0:
+                        Q1 = col_data.quantile(0.25)
+                        Q3 = col_data.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+                        outliers = ((df[col] < lower_bound) | (df[col] > upper_bound)).sum()
+                        outlier_stats[col] = {
+                            'outlier_count': outliers,
+                            'lower_bound': lower_bound,
+                            'upper_bound': upper_bound
+                        }
 
-            execution_prompt = f"""请解析并执行以下异常值处理方案：
+            show_loading_indicator("🤖 AI正在分析您的需求并生成处理代码...")
+
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理异常值。
 
 数据集信息:
-- 形状: {df.shape}
+- 数据形状: {df.shape}
 - 列名: {list(df.columns)}
 - 数值列: {numeric_cols}
-- 异常值信息: {outlier_info}
+- 异常值统计: {outlier_stats}
 
-自定义方案: "{custom_solution}"
+用户要求: "{custom_solution}"
 
-请生成Python代码来执行这个方案，只返回代码部分："""
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理异常值
+4. 可以使用 pandas 和 numpy 库
 
-            response = self.cleaning_handler.llm.invoke(execution_prompt)
-            code = response.content.strip()
+示例代码格式：
+# 删除异常值
+df = df[(df['column'] >= lower_bound) & (df['column'] <= upper_bound)]
+# 或者缩尾处理
+df['column'] = np.clip(df['column'], lower_bound, upper_bound)
+
+请生成代码："""
+
+            # 使用流式输出生成代码
+            full_response = ""
+            for chunk in self.cleaning_handler.llm.stream(execution_prompt):
+                if hasattr(chunk, 'content') and chunk.content:
+                    full_response += chunk.content
+                    placeholder.markdown(f"**AI正在生成代码:**\n```python\n{full_response}\n```")
+                    time.sleep(0.05)
+            
+            code = full_response.strip()
+            
+            # 清理代码
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            if not code:
+                placeholder.error("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            placeholder.success(f"✅ 代码生成完成！\n\n**生成的代码:**\n```python\n{code}\n```")
+            
+            # 显示更明显的提示，让用户有时间阅读代码
+            st.markdown("""
+            <div style="
+                background: linear-gradient(45deg, #00b894, #00a085);
+                color: white;
+                padding: 15px 20px;
+                border-radius: 10px;
+                margin: 10px 0;
+                text-align: center;
+                font-weight: bold;
+                font-size: 16px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            ">
+                📋 请查看上方生成的代码，系统将在3秒后自动执行...
+            </div>
+            """, unsafe_allow_html=True)
+            
+            time.sleep(3)  # 给用户时间阅读代码
+            
+            show_loading_indicator("🔧 正在执行代码处理数据...")
 
             # 安全地执行代码
             local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
             exec(code, {}, local_vars)
 
             result_df = local_vars['df']
+            
+            # 验证结果
+            original_shape = df.shape
+            result_shape = result_df.shape
+            
+            placeholder.success(f"🎉 处理完成！\n\n**处理结果:**\n- 处理前数据形状: {original_shape}\n- 处理后数据形状: {result_shape}")
+            
+            return result_df
+
+        except Exception as e:
+            placeholder.error(f"❌ 自定义方案执行失败: {e}")
+            placeholder.info("🔄 回退到建议方案")
+            return self.apply_suggested_solution(df, processing_details)
+    
+    def apply_custom_solution(self, df: pd.DataFrame, custom_solution: str, processing_details: Dict) -> pd.DataFrame:
+        """应用用户自定义的异常值处理方案"""
+        try:
+            numeric_cols = processing_details.get('numeric_cols', [])
+            outlier_info = processing_details.get('outlier_info', {})
+            
+            # 计算异常值统计
+            outlier_stats = {}
+            for col in numeric_cols:
+                if col in df.columns:
+                    col_data = df[col].dropna()
+                    if len(col_data) > 0:
+                        Q1 = col_data.quantile(0.25)
+                        Q3 = col_data.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+                        outliers = ((df[col] < lower_bound) | (df[col] > upper_bound)).sum()
+                        outlier_stats[col] = {
+                            'outlier_count': outliers,
+                            'lower_bound': lower_bound,
+                            'upper_bound': upper_bound
+                        }
+
+            execution_prompt = f"""作为数据清洗专家，请根据用户要求生成Python代码来处理异常值。
+
+数据集信息:
+- 数据形状: {df.shape}
+- 列名: {list(df.columns)}
+- 数值列: {numeric_cols}
+- 异常值统计: {outlier_stats}
+
+用户要求: "{custom_solution}"
+
+请生成Python代码来执行用户的要求。代码要求：
+1. 只返回可执行的Python代码，不要包含解释文字
+2. 使用变量名 'df' 表示DataFrame
+3. 确保代码能正确处理异常值
+4. 可以使用 pandas 和 numpy 库
+
+示例代码格式：
+# 删除异常值
+df = df[(df['column'] >= lower_bound) & (df['column'] <= upper_bound)]
+# 或者缩尾处理
+df['column'] = np.clip(df['column'], lower_bound, upper_bound)
+
+请生成代码："""
+
+            response = self.cleaning_handler.llm.invoke(execution_prompt)
+            code = response.content.strip()
+            
+            # 清理代码，移除可能的markdown标记和解释文字
+            lines = code.split('\n')
+            code_lines = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                if in_code_block or (line and not line.startswith('#') and not line.startswith('作为') and not line.startswith('请')):
+                    if line.startswith('#'):
+                        continue
+                    code_lines.append(line)
+            
+            code = '\n'.join(code_lines).strip()
+            
+            if not code:
+                print("⚠️ LLM未生成有效代码，使用默认处理")
+                return self.apply_suggested_solution(df, processing_details)
+
+            print(f"🔧 执行用户自定义方案:")
+            print(f"用户要求: {custom_solution}")
+            print(f"生成代码: {code}")
+
+            # 安全地执行代码
+            local_vars = {'df': df.copy(), 'pd': pd, 'np': np}
+            exec(code, {}, local_vars)
+
+            result_df = local_vars['df']
+            
+            # 验证结果
+            original_shape = df.shape
+            result_shape = result_df.shape
+            
+            print(f"✅ 处理完成:")
+            print(f"   - 处理前数据形状: {original_shape}")
+            print(f"   - 处理后数据形状: {result_shape}")
+            
             return result_df
 
         except Exception as e:
@@ -564,6 +1119,53 @@ class OutlierHandler:
 # Helper Functions
 # ---------------------------
 
+def show_loading_indicator(message: str, position: str = "below"):
+    """显示与主题一致的加载指示器"""
+    # 使用与主题一致的蓝色渐变背景
+    st.markdown(f"""
+    <div style="
+        background: linear-gradient(45deg, #667eea, #764ba2);
+        color: white;
+        padding: 20px 25px;
+        border-radius: 15px;
+        margin: 15px 0;
+        text-align: center;
+        font-weight: bold;
+        font-size: 18px;
+        box-shadow: 0 6px 12px rgba(102, 126, 234, 0.3);
+        animation: pulse 1.5s ease-in-out infinite;
+        border: 2px solid rgba(255,255,255,0.2);
+    ">
+        <div style="display: flex; align-items: center; justify-content: center; gap: 15px;">
+            <div style="
+                width: 30px;
+                height: 30px;
+                border: 4px solid rgba(255,255,255,0.3);
+                border-top: 4px solid white;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            "></div>
+            <span style="font-size: 20px;">{message}</span>
+        </div>
+    </div>
+    
+    <style>
+        @keyframes spin {{
+            0% {{ transform: rotate(0deg); }}
+            100% {{ transform: rotate(360deg); }}
+        }}
+        @keyframes pulse {{
+            0%, 100% {{ 
+                opacity: 1; 
+                transform: scale(1);
+            }}
+            50% {{ 
+                opacity: 0.8; 
+                transform: scale(1.02);
+            }}
+        }}
+    </style>
+    """, unsafe_allow_html=True)
 
 def get_next_question(step: str, config: dict, available_columns: list) -> str:
     """根据当前步骤生成下一个问题"""
@@ -676,7 +1278,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 应用成熟的白色主题模板
+# 简洁白色主题模板
 st.markdown("""
 <style>
     /* 主应用背景 */
@@ -693,16 +1295,31 @@ st.markdown("""
         margin-top: 1rem;
     }
     
+    
     /* 侧边栏 */
     .stSidebar {
-        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
     }
     
     .stSidebar .stSelectbox > label,
     .stSidebar .stTextInput > label,
     .stSidebar .stTextArea > label {
-        color: white !important;
+        color: #2c3e50 !important;
         font-weight: 600;
+    }
+    
+    /* 侧边栏文字颜色 */
+    .stSidebar .stMarkdown,
+    .stSidebar .stText,
+    .stSidebar p,
+    .stSidebar div {
+        color: #2c3e50 !important;
+    }
+    
+    .stSidebar h1, .stSidebar h2, .stSidebar h3, 
+    .stSidebar h4, .stSidebar h5, .stSidebar h6 {
+        color: #2c3e50 !important;
+        font-weight: 700;
     }
     
     /* 文字颜色 */
@@ -1062,7 +1679,85 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         margin: 0.5rem 0;
     }
+    
+    /* 改善help文字可见性 */
+    .stTextInput > div > div > div[data-testid="stMarkdownContainer"] {
+        color: #667eea !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        margin-top: 5px !important;
+    }
+    
+    /* 输入框help文字样式 */
+    .stTextInput [data-testid="stMarkdownContainer"] p {
+        color: #667eea !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        background: rgba(102, 126, 234, 0.1) !important;
+        padding: 5px 10px !important;
+        border-radius: 5px !important;
+        border-left: 3px solid #667eea !important;
+    }
+    
+    /* 隐藏Streamlit默认的按回车提示 */
+    .stTextInput [data-testid="stMarkdownContainer"] p {
+        display: none !important;
+    }
+    
+    /* 美化help文字样式 */
+    .stTextInput [data-testid="stMarkdownContainer"] p:first-child {
+        display: block !important;
+        color: #667eea !important;
+        font-weight: 500 !important;
+        font-size: 13px !important;
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1)) !important;
+        padding: 8px 12px !important;
+        border-radius: 8px !important;
+        border-left: 3px solid #667eea !important;
+        margin-top: 8px !important;
+        box-shadow: 0 2px 4px rgba(102, 126, 234, 0.1) !important;
+    }
+    
+    /* 为输入框添加优雅的按回车提示 */
+    .stTextInput::after {
+        content: "💡 输入完成后按回车键提交";
+        display: block;
+        color: #667eea !important;
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1)) !important;
+        font-weight: 500 !important;
+        font-size: 12px !important;
+        padding: 6px 10px !important;
+        border-radius: 6px !important;
+        margin-top: 6px !important;
+        text-align: center !important;
+        border: 1px solid rgba(102, 126, 234, 0.2) !important;
+        box-shadow: 0 1px 3px rgba(102, 126, 234, 0.1) !important;
+    }
 </style>
+
+<script>
+// 隐藏Streamlit默认的按回车提示
+function hideDefaultEnterText() {
+    const elements = document.querySelectorAll('*');
+    elements.forEach(element => {
+        if (element.textContent && 
+            (element.textContent.includes('PRESS ENTER TO APPLY') || 
+             element.textContent.includes('按回车键应用'))) {
+            element.style.display = 'none';
+        }
+    });
+}
+
+// 页面加载完成后执行
+document.addEventListener('DOMContentLoaded', hideDefaultEnterText);
+
+// 监听DOM变化，处理动态添加的元素
+const observer = new MutationObserver(hideDefaultEnterText);
+observer.observe(document.body, {
+    childList: true,
+    subtree: true
+});
+</script>
 """, unsafe_allow_html=True)
 st.title(TITLE)
 
@@ -1095,7 +1790,7 @@ openai_api_data = dict(
 
 # Initialize LLM with default model
 llm = ChatOpenAI(
-    model="gpt-3.5-turbo",  # Default model
+    model="deepseek-chat",  # Default model
     api_key=openai_api_data['api_key'],
     base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None
 )
@@ -1150,21 +1845,30 @@ if df is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.write("**数据形状:**", df.shape)
-        st.write("**所有列:**", list(df.columns))
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        st.write("**数值列:**", numeric_cols)
     with col2:
-        st.write("**目标值统计:**")
-        if '目标值' in df.columns:
-            st.write(df['目标值'].describe())
-        elif len(numeric_cols) > 0:
-            st.write("**数值数据统计:**")
-            st.write(df[numeric_cols].describe())
+        st.write("**数据概览:**")
+        st.write(f"• 总行数: {df.shape[0]}")
+        st.write(f"• 总列数: {df.shape[1]}")
     
-    # 存储可用列名
+    # 存储可用列名（内部使用，不显示给用户）
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     st.session_state.available_columns = list(df.columns)
     st.session_state.numeric_columns = numeric_cols
-    st.session_state.data = df
+    
+    # 只有在数据清洗未开始且没有进行中的清洗时才更新数据，避免覆盖清洗后的数据
+    if (not st.session_state.data_cleaned and 
+        st.session_state.data_cleaning_step == "detect" and 
+        st.session_state.current_issue_index == 0):
+        st.session_state.data = df
+        print(f"🔧 数据输入部分更新数据:")
+        print(f"   - 更新数据缺失值: {df.isnull().sum().sum()}")
+        print(f"   - 数据清洗状态: {st.session_state.data_cleaned}")
+        print(f"   - 清洗步骤: {st.session_state.data_cleaning_step}")
+    else:
+        print(f"🔧 数据输入部分跳过数据更新:")
+        print(f"   - 数据清洗状态: {st.session_state.data_cleaned}")
+        print(f"   - 清洗步骤: {st.session_state.data_cleaning_step}")
+        print(f"   - 当前问题索引: {st.session_state.current_issue_index}")
     
     # 初始化数据清洗处理器
     if st.session_state.data_cleaning_handler is None:
@@ -1177,12 +1881,27 @@ if df is not None:
     if not st.session_state.data_cleaned:
         st.markdown("## 🧹 数据清洗")
         
+        # 使用session_state中的数据，确保使用最新的清洗后数据
+        current_df = st.session_state.data
+        
         # 检测数据问题
         if st.session_state.data_cleaning_step == "detect":
             st.info("🔍 正在检测数据问题...")
             
+            # 显示当前数据状态
+            st.write("**当前数据状态:**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("数据形状", f"{current_df.shape[0]} × {current_df.shape[1]}")
+            with col2:
+                missing_count = current_df.isnull().sum().sum()
+                st.metric("缺失值", missing_count)
+            with col3:
+                duplicate_count = current_df.duplicated().sum()
+                st.metric("重复行", duplicate_count)
+            
             # 检测问题
-            issues = st.session_state.data_cleaning_handler.detect_data_issues(df)
+            issues = st.session_state.data_cleaning_handler.detect_data_issues(current_df)
             st.session_state.data_issues = issues
             
             if not issues:
@@ -1193,6 +1912,8 @@ if df is not None:
                 st.warning(f"⚠️ 发现 {len(issues)} 个数据问题：")
                 for i, (issue_type, description, details) in enumerate(issues, 1):
                     st.write(f"{i}. {description}")
+                    if issue_type == "missing":
+                        st.write(f"   缺失值详情: {details.to_dict()}")
                 
                 st.session_state.data_cleaning_step = "process"
                 st.session_state.current_issue_index = 0
@@ -1208,13 +1929,13 @@ if df is not None:
                 # 根据问题类型选择处理器
                 if issue_type == "missing":
                     handler = MissingValueHandler(st.session_state.data_cleaning_handler)
-                    issue_info = handler.handle_interactive(df)
+                    issue_info = handler.handle_interactive(current_df)
                 elif issue_type == "duplicate":
                     handler = DuplicateHandler(st.session_state.data_cleaning_handler)
-                    issue_info = handler.handle_interactive(df)
+                    issue_info = handler.handle_interactive(current_df)
                 elif issue_type == "outlier":
                     handler = OutlierHandler(st.session_state.data_cleaning_handler)
-                    issue_info = handler.handle_interactive(df)
+                    issue_info = handler.handle_interactive(current_df)
                 else:
                     st.error(f"未知问题类型: {issue_type}")
                     st.session_state.current_issue_index += 1
@@ -1242,18 +1963,30 @@ if df is not None:
                 # 用户交互
                 st.subheader("💭 您的选择")
                 
-                # 使用表单来支持回车键提交
-                with st.form(key=f"cleaning_form_{st.session_state.current_issue_index}"):
-                    user_input = st.text_input(
-                        "您有什么疑问吗？如果没有疑问，请输入'继续'开始处理，或者提出自定义方案：",
-                        placeholder="例如：继续、为什么这样处理、用平均值填充等",
-                        help="按回车键提交"
-                    )
-                    
-                    submitted = st.form_submit_button("💬 提交", type="primary")
+                # 直接使用文本输入框，支持回车键提交
+                user_input = st.text_input(
+                    "您有什么疑问吗？如果没有疑问，请输入'继续'开始处理，或者提出自定义方案：",
+                    placeholder="例如：继续、为什么这样处理、用平均值填充等",
+                    help="💡 输入完成后按回车键即可提交",
+                    key=f"cleaning_input_{st.session_state.current_issue_index}"
+                )
                 
-                # 处理用户输入
-                if user_input.strip() and submitted:
+                # 检查是否有新的输入
+                submitted = user_input.strip() != ""
+                
+                # 处理用户输入 - 检查是否有新的输入
+                input_key = f"cleaning_input_{st.session_state.current_issue_index}"
+                previous_input_key = f"previous_{input_key}"
+                
+                # 初始化前一次输入记录
+                if previous_input_key not in st.session_state:
+                    st.session_state[previous_input_key] = ""
+                
+                # 检查是否有新的输入（与上次不同且不为空）
+                has_new_input = (user_input.strip() != "" and 
+                               user_input.strip() != st.session_state[previous_input_key])
+                
+                if has_new_input:
                     # 初始化对话历史
                     if issue_key not in st.session_state.cleaning_conversation_history:
                         st.session_state.cleaning_conversation_history[issue_key] = []
@@ -1284,16 +2017,44 @@ if df is not None:
                                     break
                             
                             if custom_solution:
-                                # 应用自定义方案
-                                if issue_type == "missing":
-                                    df = handler.apply_custom_solution(df, custom_solution, issue_info['processing_details'])
-                                elif issue_type == "duplicate":
-                                    df = handler.apply_custom_solution(df, custom_solution, issue_info['processing_details'])
-                                elif issue_type == "outlier":
-                                    df = handler.apply_custom_solution(df, custom_solution, issue_info['processing_details'])
+                                # 应用自定义方案 - 使用流式输出
+                                placeholder = st.empty()
+                                show_loading_indicator("🤖 正在执行您的自定义方案...")
                                 
-                                st.success("✅ 已应用自定义方案")
-                                st.session_state.data = df
+                                # 调试信息：执行前数据状态
+                                print(f"🔧 自定义方案执行前调试:")
+                                print(f"   - 执行前缺失值: {current_df.isnull().sum().sum()}")
+                                print(f"   - 执行前数据形状: {current_df.shape}")
+                                print(f"   - 自定义方案: {custom_solution}")
+                                print(f"   - 问题类型: {issue_type}")
+                                
+                                if issue_type == "missing":
+                                    current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                                elif issue_type == "duplicate":
+                                    current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                                elif issue_type == "outlier":
+                                    current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                                
+                                # 调试信息：执行后数据状态
+                                print(f"🔧 自定义方案执行后调试:")
+                                print(f"   - 执行后缺失值: {current_df.isnull().sum().sum()}")
+                                print(f"   - 执行后数据形状: {current_df.shape}")
+                                print(f"   - 数据是否改变: {not current_df.equals(st.session_state.data)}")
+                                
+                                st.session_state.data = current_df
+                                
+                                # 调试信息：session状态更新后
+                                print(f"🔧 Session状态更新后调试:")
+                                print(f"   - Session数据缺失值: {st.session_state.data.isnull().sum().sum()}")
+                                print(f"   - Session数据形状: {st.session_state.data.shape}")
+                                print(f"   - 数据已被处理: True")
+                                print(f"   - 数据内容样本:")
+                                print(f"{st.session_state.data.head()}")
+                                print(f"   - 数据类型:")
+                                print(f"{st.session_state.data.dtypes}")
+                                print(f"   - 缺失值位置:")
+                                print(f"{st.session_state.data.isnull().sum()}")
+                                
                                 st.session_state.current_issue_index += 1
                                 st.rerun()
                         elif any(keyword in user_input.lower() for keyword in ["取消", "不执行", "不要", "算了"]):
@@ -1301,9 +2062,15 @@ if df is not None:
                             # 清除确认状态，继续对话
                             st.rerun()
                         else:
-                            # 继续讨论
-                            ai_response = st.session_state.data_cleaning_handler.llm_generate_response_with_fallback(
-                                user_input, issue_type, st.session_state.cleaning_conversation_history[issue_key], issue_info['processing_details']
+                            # 继续讨论 - 使用流式输出
+                            # 在输入框下方显示加载指示器
+                            st.markdown("---")  # 添加分隔线
+                            show_loading_indicator("🤖 AI正在思考...")
+                            placeholder = st.empty()
+                            
+                            ai_response = st.session_state.data_cleaning_handler.llm_generate_response_streaming(
+                                user_input, issue_type, st.session_state.cleaning_conversation_history[issue_key], 
+                                issue_info['processing_details'], placeholder
                             )
                             
                             st.session_state.cleaning_conversation_history[issue_key].append({
@@ -1321,14 +2088,72 @@ if df is not None:
                         if intent == "agree":
                             # 应用建议方案
                             if issue_type == "missing":
-                                df = handler.apply_suggested_solution(df, issue_info['processing_details'])
+                                current_df = handler.apply_suggested_solution(current_df, issue_info['processing_details'])
                             elif issue_type == "duplicate":
-                                df = handler.apply_suggested_solution(df, issue_info['processing_details'])
+                                current_df = handler.apply_suggested_solution(current_df, issue_info['processing_details'])
                             elif issue_type == "outlier":
-                                df = handler.apply_suggested_solution(df, issue_info['processing_details'])
+                                current_df = handler.apply_suggested_solution(current_df, issue_info['processing_details'])
                             
                             st.success("✅ 已应用建议方案")
-                            st.session_state.data = df
+                            st.session_state.data = current_df
+                            
+                            # 验证数据更新
+                            remaining_missing = st.session_state.data.isnull().sum().sum()
+                            st.info(f"📊 数据更新完成，剩余缺失值: {remaining_missing}")
+                            
+                            # 调试信息：验证数据更新
+                            print(f"🔧 建议方案数据更新调试:")
+                            print(f"   - 更新后缺失值: {st.session_state.data.isnull().sum().sum()}")
+                            print(f"   - 数据形状: {st.session_state.data.shape}")
+                            print(f"   - 数据内容样本:")
+                            print(f"{st.session_state.data.head()}")
+                            print(f"   - 数据类型:")
+                            print(f"{st.session_state.data.dtypes}")
+                            print(f"   - 缺失值位置:")
+                            print(f"{st.session_state.data.isnull().sum()}")
+                            
+                            st.session_state.current_issue_index += 1
+                            st.rerun()
+                            
+                        elif intent == "custom" or custom_solution:
+                            # 直接执行自定义方案，不需要确认
+                            placeholder = st.empty()
+                            show_loading_indicator("🤖 正在执行您的自定义方案...")
+                            
+                            # 调试信息：执行前数据状态
+                            print(f"🔧 自定义方案执行前调试:")
+                            print(f"   - 执行前缺失值: {current_df.isnull().sum().sum()}")
+                            print(f"   - 执行前数据形状: {current_df.shape}")
+                            print(f"   - 自定义方案: {custom_solution}")
+                            print(f"   - 问题类型: {issue_type}")
+                            
+                            if issue_type == "missing":
+                                current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                            elif issue_type == "duplicate":
+                                current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                            elif issue_type == "outlier":
+                                current_df = handler.apply_custom_solution_streaming(current_df, custom_solution, issue_info['processing_details'], placeholder)
+                            
+                            # 调试信息：执行后数据状态
+                            print(f"🔧 自定义方案执行后调试:")
+                            print(f"   - 执行后缺失值: {current_df.isnull().sum().sum()}")
+                            print(f"   - 执行后数据形状: {current_df.shape}")
+                            print(f"   - 数据是否改变: {not current_df.equals(st.session_state.data)}")
+                            
+                            st.session_state.data = current_df
+                            
+                            # 调试信息：session状态更新后
+                            print(f"🔧 Session状态更新后调试:")
+                            print(f"   - Session数据缺失值: {st.session_state.data.isnull().sum().sum()}")
+                            print(f"   - Session数据形状: {st.session_state.data.shape}")
+                            print(f"   - 数据已被处理: True")
+                            print(f"   - 数据内容样本:")
+                            print(f"{st.session_state.data.head()}")
+                            print(f"   - 数据类型:")
+                            print(f"{st.session_state.data.dtypes}")
+                            print(f"   - 缺失值位置:")
+                            print(f"{st.session_state.data.isnull().sum()}")
+                            
                             st.session_state.current_issue_index += 1
                             st.rerun()
                             
@@ -1358,9 +2183,15 @@ if df is not None:
                             st.rerun()
                             
                         elif intent == "question":
-                            # 生成回答
-                            ai_response = st.session_state.data_cleaning_handler.llm_generate_response_with_fallback(
-                                user_input, issue_type, st.session_state.cleaning_conversation_history[issue_key], issue_info['processing_details']
+                            # 生成回答 - 使用流式输出
+                            # 在输入框下方显示加载指示器
+                            st.markdown("---")  # 添加分隔线
+                            show_loading_indicator("🤖 AI正在思考...")
+                            placeholder = st.empty()
+                            
+                            ai_response = st.session_state.data_cleaning_handler.llm_generate_response_streaming(
+                                user_input, issue_type, st.session_state.cleaning_conversation_history[issue_key], 
+                                issue_info['processing_details'], placeholder
                             )
                             
                             # 添加AI回答到历史
@@ -1371,6 +2202,10 @@ if df is not None:
                             
                             # 重新渲染以显示对话
                             st.rerun()
+                
+                # 更新前一次输入记录
+                if has_new_input:
+                    st.session_state[previous_input_key] = user_input.strip()
                 
                 # 处理自定义方案的确认执行
                 if issue_key in st.session_state.cleaning_conversation_history:
@@ -1396,18 +2231,48 @@ if df is not None:
     if st.session_state.data_cleaned:
         st.success("✅ 数据清洗完成")
         st.subheader("清洗后数据预览")
-        st.dataframe(st.session_state.data.head(10))
         
-        col1, col2 = st.columns(2)
+        # 调试信息：显示当前数据状态
+        print(f"🔧 清洗后数据显示调试:")
+        print(f"   - 当前数据缺失值: {st.session_state.data.isnull().sum().sum()}")
+        print(f"   - 当前数据形状: {st.session_state.data.shape}")
+        print(f"   - 数据清洗状态: {st.session_state.data_cleaned}")
+        
+        # 重新检测数据问题，确保显示的是最新状态
+        final_issues = st.session_state.data_cleaning_handler.detect_data_issues(st.session_state.data)
+        if final_issues:
+            st.warning(f"⚠️ 清洗后仍发现 {len(final_issues)} 个问题，可能需要进一步处理")
+            for i, (issue_type, description, details) in enumerate(final_issues, 1):
+                st.write(f"{i}. {description}")
+        else:
+            st.success("🎉 数据质量良好，所有问题已解决！")
+        
+        # 显示数据统计
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.write("**清洗后数据形状:**", st.session_state.data.shape)
         with col2:
+            missing_count = st.session_state.data.isnull().sum().sum()
+            st.write("**剩余缺失值:**", missing_count)
+        with col3:
+            duplicate_count = st.session_state.data.duplicated().sum()
+            st.write("**剩余重复行:**", duplicate_count)
+        
+        # 显示数据预览
+        st.dataframe(st.session_state.data.head(10))
+        
+        # 控制按钮
+        col1, col2 = st.columns(2)
+        with col1:
             if st.button("🔄 重新清洗数据"):
                 st.session_state.data_cleaned = False
                 st.session_state.data_cleaning_step = "detect"
                 st.session_state.data_issues = []
                 st.session_state.current_issue_index = 0
                 st.rerun()
+        with col2:
+            if st.button("📊 查看完整数据"):
+                st.dataframe(st.session_state.data, use_container_width=True)
     
 # ---------------------------
 # Intelligent Chat Interface
