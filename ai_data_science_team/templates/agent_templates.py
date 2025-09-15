@@ -458,10 +458,26 @@ def node_func_human_review(
     """
     print("    * HUMAN REVIEW")
     
-    code_markdown=f"```{code_type}\n" + state.get(code_snippet_key)+"\n```"
+    # Safely stringify recommended steps and code snippet (may be dict/list)
+    import json as _json
+    _steps_val = state.get(recommended_steps_key, '')
+    if not isinstance(_steps_val, str):
+        try:
+            _steps_val = _json.dumps(_steps_val, ensure_ascii=False, indent=2)
+        except Exception:
+            _steps_val = str(_steps_val)
+
+    _code_val = state.get(code_snippet_key, '')
+    if not isinstance(_code_val, str):
+        try:
+            _code_val = _json.dumps(_code_val, ensure_ascii=False, indent=2)
+        except Exception:
+            _code_val = str(_code_val)
+
+    code_markdown = f"```{code_type}\n" + _code_val + "\n```"
 
     # Display instructions and get user response
-    user_input = interrupt(value=prompt_text.format(steps=state.get(recommended_steps_key, '') + "\n\n" + code_markdown))
+    user_input = interrupt(value=prompt_text.format(steps=_steps_val + "\n\n" + code_markdown))
 
     # Decide next steps based on user input
     if user_input.strip().lower() == "yes":

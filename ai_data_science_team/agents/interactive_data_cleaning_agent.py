@@ -3,43 +3,31 @@
 # ***
 # * Agents: Interactive Data Cleaning Agent
 
-# Libraries
-from typing import TypedDict, Annotated, Sequence, Literal, Dict, Any, Optional
+import json
 import operator
-import time
-import re
+import os
+from typing import TypedDict, Annotated, Sequence, Literal
 
-from langchain.prompts import PromptTemplate
+import pandas as pd
+from IPython.display import Markdown
 from langchain_core.messages import BaseMessage
-from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Checkpointer
+from langgraph.types import interrupt, Command
 
-import os
-import json
-import pandas as pd
-import numpy as np
-
-from IPython.display import Markdown
-
-from ai_data_science_team.templates import(
-    node_func_execute_agent_code_on_data, 
-    node_func_human_review,
-    node_func_fix_agent_code, 
+from ai_data_science_team.templates import (
+    node_func_execute_agent_code_on_data,
+    node_func_fix_agent_code,
     node_func_report_agent_outputs,
     create_coding_agent_graph,
     BaseAgent,
 )
-from ai_data_science_team.parsers.parsers import PythonOutputParser
+from ai_data_science_team.utils.logging import log_ai_function
 from ai_data_science_team.utils.regex import (
-    relocate_imports_inside_function, 
-    add_comments_to_top, 
-    format_agent_name, 
-    format_recommended_steps, 
+    add_comments_to_top,
+    format_agent_name,
     get_generic_summary,
 )
-from ai_data_science_team.tools.dataframe import get_dataframe_summary
-from ai_data_science_team.utils.logging import log_ai_function
 
 # Setup
 AGENT_NAME = "interactive_data_cleaning_agent"
@@ -114,9 +102,11 @@ class InteractiveDataCleaningAgent(BaseAgent):
 
     async def ainvoke_agent(self, data_raw: pd.DataFrame, user_instructions: str=None, max_retries:int=3, retry_count:int=0, **kwargs):
         """Asynchronously invokes the agent."""
+        # Convert DataFrame to serializable format
+        data_dict = data_raw.to_dict('records')
         response = await self._compiled_graph.ainvoke({
             "user_instructions": user_instructions,
-            "data_raw": data_raw.to_dict(),
+            "data_raw": data_dict,
             "max_retries": max_retries,
             "retry_count": retry_count,
         }, **kwargs)
@@ -125,9 +115,11 @@ class InteractiveDataCleaningAgent(BaseAgent):
     
     def invoke_agent(self, data_raw: pd.DataFrame, user_instructions: str=None, max_retries:int=3, retry_count:int=0, **kwargs):
         """Invokes the agent."""
+        # Convert DataFrame to serializable format
+        data_dict = data_raw.to_dict('records')
         response = self._compiled_graph.invoke({
             "user_instructions": user_instructions,
-            "data_raw": data_raw.to_dict(),
+            "data_raw": data_dict,
             "max_retries": max_retries,
             "retry_count": retry_count,
         }, **kwargs)
@@ -234,7 +226,7 @@ def make_interactive_data_cleaning_agent(
         print("    * DETECTING DATA ISSUES")
 
         data_raw = state.get("data_raw")
-        df = pd.DataFrame.from_dict(data_raw)
+        df = pd.DataFrame(data_raw)
         
         issues = []
         
@@ -242,12 +234,14 @@ def make_interactive_data_cleaning_agent(
         missing_counts = df.isnull().sum()
         missing_columns = missing_counts[missing_counts > 0]
         if len(missing_columns) > 0:
-            issues.append(('missing', f"发现 {len(missing_columns)} 列有缺失值", missing_columns.to_dict()))
+            # Convert numpy types to Python types for serialization
+            missing_dict = {col: int(count) for col, count in missing_columns.to_dict().items()}
+            issues.append(('missing', f"发现 {len(missing_columns)} 列有缺失值", missing_dict))
 
         # Detect duplicates
         duplicate_count = df.duplicated().sum()
         if duplicate_count > 0:
-            issues.append(('duplicate', f"发现 {duplicate_count} 个重复行", {"count": duplicate_count}))
+            issues.append(('duplicate', f"发现 {duplicate_count} 个重复行", {"count": int(duplicate_count)}))
 
         # Detect outliers (simple detection for numeric columns)
         numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
@@ -266,9 +260,9 @@ def make_interactive_data_cleaning_agent(
                     if outliers > 0:
                         has_outliers = True
                         outlier_info[col] = {
-                            'outliers': outliers,
-                            'lower_bound': lower_bound,
-                            'upper_bound': upper_bound
+                            'outliers': int(outliers),
+                            'lower_bound': float(lower_bound),
+                            'upper_bound': float(upper_bound)
                         }
 
             if has_outliers:
@@ -300,22 +294,28 @@ def make_interactive_data_cleaning_agent(
         
         issue_type, description, details = issues[current_index]
         
-        # Generate recommended solution
-        if issue_type == 'missing':
-            solution = generate_missing_value_solution(details)
-        elif issue_type == 'duplicate':
-            solution = generate_duplicate_solution(details)
-        elif issue_type == 'outlier':
-            solution = generate_outlier_solution(details)
+        # Check if we need to regenerate solution (when user disagreed and wants retry)
+        custom_solution = state.get("custom_solution", "")
+        if not custom_solution and not state.get("agreed", False):
+            # Generate recommended solution
+            if issue_type == 'missing':
+                solution = generate_missing_value_solution(details)
+            elif issue_type == 'duplicate':
+                solution = generate_duplicate_solution(details)
+            elif issue_type == 'outlier':
+                solution = generate_outlier_solution(details)
+            else:
+                solution = f"处理 {issue_type} 问题"
         else:
-            solution = f"处理 {issue_type} 问题"
+            # Use existing solution
+            solution = state.get("recommended_steps", f"处理 {issue_type} 问题")
         
         return {
             "processing_type": issue_type,
             "processing_details": details,
             "recommended_steps": solution,
             "agreed": False,
-            "custom_solution": ""
+            "custom_solution": custom_solution
         }
 
     def interactive_human_review(state: GraphState) -> Command[Literal["interactive_issue_handler", "create_cleaning_code", "interactive_issue_handler"]]:
@@ -330,10 +330,7 @@ def make_interactive_data_cleaning_agent(
         prompt_text = f"""
 🤖 数据清洗建议
 
-处理类型: {processing_type}
-问题描述: {recommended_steps}
-
-处理详情: {json.dumps(processing_details, ensure_ascii=False, indent=2)}
+{recommended_steps}
 
 请选择您的操作：
 1. 输入 'yes' 或 '继续' - 同意当前方案
@@ -352,13 +349,44 @@ def make_interactive_data_cleaning_agent(
         )
         
         if intent == "agree":
-            return Command(goto="create_cleaning_code", update={"agreed": True})
+            return Command(goto="interactive_issue_handler", update={"agreed": True})
         elif intent == "disagree":
-            # Skip this issue and move to next
-            return Command(goto="interactive_issue_handler", update={
-                "current_issue_index": state.get("current_issue_index", 0) + 1,
-                "agreed": False
-            })
+            # Ask user what they want to do instead of skipping
+            new_prompt = f"❌ 您拒绝了当前方案。请选择：\n1. 输入 'skip' - 跳过这个问题\n2. 输入 'retry' - 重新生成方案\n3. 输入自定义方案 - 提出您的处理方案\n\n您的选择: "
+            user_input2 = interrupt(value=new_prompt)
+            
+            if user_input2.lower().strip() in ['skip', '跳过']:
+                return Command(goto="interactive_issue_handler", update={
+                    "current_issue_index": state.get("current_issue_index", 0) + 1,
+                    "agreed": False
+                })
+            elif user_input2.lower().strip() in ['retry', '重新生成', '重试']:
+                # Generate new solution and ask again
+                return Command(goto="interactive_issue_handler", update={
+                    "agreed": False,
+                    "custom_solution": ""
+                })
+            else:
+                # Treat as custom solution
+                is_reasonable, feedback = evaluate_solution_with_fallback(
+                    user_input2, processing_type, processing_details, state.get("llm_timeout", 10)
+                )
+                
+                if is_reasonable:
+                    return Command(goto="interactive_issue_handler", update={
+                        "agreed": True,
+                        "custom_solution": user_input2,
+                        "recommended_steps": f"自定义方案: {user_input2}\n评估: {feedback}"
+                    })
+                else:
+                    # Show feedback and ask again
+                    new_prompt3 = f"⚠️ 方案评估: {feedback}\n\n请重新考虑您的方案: "
+                    user_input3 = interrupt(value=new_prompt3)
+                    return Command(goto="interactive_issue_handler", update={
+                        "agreed": True,
+                        "custom_solution": user_input3,
+                        "recommended_steps": f"用户坚持的自定义方案: {user_input3}"
+                    })
         elif intent == "custom_solution":
             # Evaluate and potentially apply custom solution
             is_reasonable, feedback = evaluate_solution_with_fallback(
@@ -366,7 +394,7 @@ def make_interactive_data_cleaning_agent(
             )
             
             if is_reasonable:
-                return Command(goto="create_cleaning_code", update={
+                return Command(goto="interactive_issue_handler", update={
                     "agreed": True,
                     "custom_solution": custom_solution,
                     "recommended_steps": f"自定义方案: {custom_solution}\n评估: {feedback}"
@@ -380,16 +408,24 @@ def make_interactive_data_cleaning_agent(
                 )
                 
                 if intent2 == "agree":
-                    return Command(goto="create_cleaning_code", update={
+                    return Command(goto="interactive_issue_handler", update={
                         "agreed": True,
                         "custom_solution": custom_solution,
                         "recommended_steps": f"用户坚持的自定义方案: {custom_solution}"
                     })
                 else:
-                    return Command(goto="interactive_issue_handler", update={
-                        "current_issue_index": state.get("current_issue_index", 0) + 1,
-                        "agreed": False
-                    })
+                    # User still disagrees, ask if they want to skip
+                    skip_prompt = f"⚠️ 您仍然拒绝方案。是否跳过这个问题？\n输入 'yes' 跳过，'no' 重新考虑: "
+                    skip_input = interrupt(value=skip_prompt)
+                    if skip_input.lower().strip() in ['yes', 'y', '是', '跳过']:
+                        return Command(goto="interactive_issue_handler", update={
+                            "current_issue_index": state.get("current_issue_index", 0) + 1,
+                            "agreed": False
+                        })
+                    else:
+                        return Command(goto="interactive_issue_handler", update={
+                            "agreed": False
+                        })
         else:  # question
             # Generate answer and ask again
             answer = generate_answer_with_fallback(
@@ -402,15 +438,23 @@ def make_interactive_data_cleaning_agent(
             )
             
             if intent2 == "agree":
-                return Command(goto="create_cleaning_code", update={"agreed": True})
+                return Command(goto="interactive_issue_handler", update={"agreed": True})
             elif intent2 == "disagree":
-                return Command(goto="interactive_issue_handler", update={
-                    "current_issue_index": state.get("current_issue_index", 0) + 1,
-                    "agreed": False
-                })
+                # Ask if user wants to skip this issue
+                skip_prompt = f"⚠️ 您拒绝了方案。是否跳过这个问题？\n输入 'yes' 跳过，'no' 重新考虑: "
+                skip_input = interrupt(value=skip_prompt)
+                if skip_input.lower().strip() in ['yes', 'y', '是', '跳过']:
+                    return Command(goto="interactive_issue_handler", update={
+                        "current_issue_index": state.get("current_issue_index", 0) + 1,
+                        "agreed": False
+                    })
+                else:
+                    return Command(goto="interactive_issue_handler", update={
+                        "agreed": False
+                    })
             else:
+                # For questions or unclear responses, ask again
                 return Command(goto="interactive_issue_handler", update={
-                    "current_issue_index": state.get("current_issue_index", 0) + 1,
                     "agreed": False
                 })
 
@@ -424,7 +468,7 @@ def make_interactive_data_cleaning_agent(
         recommended_steps = state.get("recommended_steps", "")
         
         data_raw = state.get("data_raw")
-        df = pd.DataFrame.from_dict(data_raw)
+        df = pd.DataFrame(data_raw)
         
         # Generate the cleaning code
         if custom_solution:
@@ -466,7 +510,7 @@ def make_interactive_data_cleaning_agent(
             error_key="data_cleaner_error",
             code_snippet_key="data_cleaner_function",
             agent_function_name=state.get("data_cleaner_function_name"),
-            pre_processing=lambda data: pd.DataFrame.from_dict(data),
+            pre_processing=lambda data: pd.DataFrame(data),
             post_processing=lambda df: df.to_dict() if isinstance(df, pd.DataFrame) else df,
             error_message_prefix="An error occurred during interactive data cleaning: "
         )
@@ -529,16 +573,50 @@ def make_interactive_data_cleaning_agent(
         solution_parts = []
         for col, count in missing_columns.items():
             solution_parts.append(f"列 '{col}' 有 {count} 个缺失值")
-        return f"缺失值处理方案: 检测到 {len(missing_columns)} 列有缺失值。建议根据数据类型和缺失比例选择填充方法。"
+        
+        detailed_solution = f"""🔍 检测到 {len(missing_columns)} 列有缺失值
+
+📊 缺失值详情:
+{chr(10).join(solution_parts)}
+
+📋 推荐处理方案:
+1. **数值列缺失值**: 使用中位数填充（对异常值更鲁棒）
+2. **分类列缺失值**: 使用众数填充，如果众数不存在则用'Unknown'
+3. **高缺失率列**: 如果缺失率>50%，考虑删除该列
+4. **低缺失率列**: 如果缺失率<5%，可以删除包含缺失值的行"""
+        
+        return detailed_solution
 
     def generate_duplicate_solution(duplicate_details):
         """Generate solution for duplicates."""
         count = duplicate_details.get("count", 0)
-        return f"重复值处理方案: 发现 {count} 个重复行。建议删除重复行，保留第一个出现的记录。"
+        
+        detailed_solution = f"""🔍 发现 {count} 个重复行
+
+📋 推荐处理方案:
+1. **重复行识别**: 基于所有列的值进行重复检测
+2. **保留策略**: 保留第一个出现的行（keep='first'）
+3. **删除操作**: 安全删除重复行并记录删除数量"""
+        
+        return detailed_solution
 
     def generate_outlier_solution(outlier_details):
         """Generate solution for outliers."""
-        return f"异常值处理方案: 检测到数值列中的异常值。建议根据异常值比例采用不同的处理策略。"
+        outlier_info = []
+        for col, info in outlier_details.items():
+            outlier_info.append(f"列 '{col}': {info['outliers']} 个异常值 (范围: {info['lower_bound']:.2f} - {info['upper_bound']:.2f})")
+        
+        detailed_solution = f"""🔍 检测到数值列中的异常值
+
+📊 异常值详情:
+{chr(10).join(outlier_info)}
+
+📋 推荐处理方案:
+1. **异常值检测**: 使用IQR方法（四分位距法）
+2. **阈值计算**: Q1 - 1.5×IQR 到 Q3 + 1.5×IQR
+3. **处理策略**: 缩尾处理（Winsorization）- 将异常值限制在合理范围内"""
+        
+        return detailed_solution
 
     def classify_user_intent_with_fallback(user_input, processing_type, timeout):
         """Classify user intent with fallback."""
@@ -653,17 +731,27 @@ def make_interactive_data_cleaning_agent(
 
 自定义方案: "{custom_solution}"
 
-请生成Python代码来执行这个方案，只返回代码部分："""
+请生成Python代码来执行这个方案，只返回纯代码部分，不要包含markdown格式的代码块标记："""
 
             response = llm.invoke(execution_prompt)
             code = response.content.strip()
+            
+            # Clean the code - remove markdown formatting
+            if code.startswith('```python'):
+                code = code[9:]  # Remove ```python
+            if code.startswith('```'):
+                code = code[3:]   # Remove ```
+            if code.endswith('```'):
+                code = code[:-3]  # Remove trailing ```
+            
+            code = code.strip()
             
             # Wrap in function
             function_code = f"""def {function_name}(data_raw):
     import pandas as pd
     import numpy as np
     
-    df = pd.DataFrame.from_dict(data_raw)
+    df = pd.DataFrame(data_raw)
     
     {code}
     
@@ -688,7 +776,7 @@ def make_interactive_data_cleaning_agent(
     import pandas as pd
     import numpy as np
     
-    df = pd.DataFrame.from_dict(data_raw)
+    df = pd.DataFrame(data_raw)
     
     # 基础数据清洗
     # TODO: 添加具体的清洗逻辑
@@ -697,25 +785,25 @@ def make_interactive_data_cleaning_agent(
 
     def generate_missing_value_cleaning_code(processing_details, df):
         """Generate code for missing value cleaning."""
-        code_parts = ["df = pd.DataFrame.from_dict(data_raw)"]
+        code_parts = ["    df = pd.DataFrame.from_dict(data_raw)"]
         
         for col, count in processing_details.items():
             if col in df.columns:
                 col_type = df[col].dtype
                 if col_type in ['int64', 'float64']:
-                    code_parts.append(f"# 数值列 {col} 使用中位数填充")
-                    code_parts.append(f"df['{col}'] = df['{col}'].fillna(df['{col}'].median())")
+                    code_parts.append(f"    # 数值列 {col} 使用中位数填充")
+                    code_parts.append(f"    df['{col}'] = df['{col}'].fillna(df['{col}'].median())")
                 else:
-                    code_parts.append(f"# 分类列 {col} 使用众数填充")
-                    code_parts.append(f"df['{col}'] = df['{col}'].fillna(df['{col}'].mode()[0] if not df['{col}'].mode().empty else 'Unknown')")
+                    code_parts.append(f"    # 分类列 {col} 使用众数填充")
+                    code_parts.append(f"    df['{col}'] = df['{col}'].fillna(df['{col}'].mode()[0] if not df['{col}'].mode().empty else 'Unknown')")
         
-        code_parts.append("return df")
+        code_parts.append("    return df")
         
         function_code = f"""def {function_name}(data_raw):
     import pandas as pd
     import numpy as np
     
-    {chr(10).join(code_parts)}"""
+{chr(10).join(code_parts)}"""
         
         return function_code
 
@@ -725,7 +813,7 @@ def make_interactive_data_cleaning_agent(
     import pandas as pd
     import numpy as np
     
-    df = pd.DataFrame.from_dict(data_raw)
+    df = pd.DataFrame(data_raw)
     
     # 删除重复行，保留第一个出现的
     initial_count = len(df)
@@ -744,7 +832,7 @@ def make_interactive_data_cleaning_agent(
     import pandas as pd
     import numpy as np
     
-    df = pd.DataFrame.from_dict(data_raw)
+    df = pd.DataFrame(data_raw)
     
     # 处理异常值
     numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
@@ -778,22 +866,71 @@ def make_interactive_data_cleaning_agent(
         "report_agent_outputs": report_agent_outputs,
     }
 
-    # Create the workflow using the existing template
-    app = create_coding_agent_graph(
-        GraphState=GraphState,
-        node_functions=node_functions,
-        recommended_steps_node_name="detect_data_issues",
-        create_code_node_name="interactive_issue_handler",
-        execute_code_node_name="execute_cleaning_code",
-        fix_code_node_name="fix_cleaning_code",
-        explain_code_node_name="report_agent_outputs",
-        error_key="data_cleaner_error",
-        human_in_the_loop=True,
-        human_review_node_name="interactive_human_review",
+    # Create the workflow manually for interactive cleaning
+    from langgraph.graph import StateGraph, END
+    
+    workflow = StateGraph(GraphState)
+    
+    # Add all nodes
+    for node_name, node_func in node_functions.items():
+        workflow.add_node(node_name, node_func)
+    
+    # Set entry point
+    workflow.set_entry_point("detect_data_issues")
+    
+    # Add edges for the interactive flow
+    workflow.add_edge("detect_data_issues", "interactive_issue_handler")
+    workflow.add_edge("interactive_issue_handler", "interactive_human_review")
+    
+    # Conditional edges from human review
+    workflow.add_conditional_edges(
+        "interactive_human_review",
+        lambda state: "create_cleaning_code" if state.get("agreed", False) else "interactive_issue_handler",
+        {
+            "create_cleaning_code": "create_cleaning_code",
+            "interactive_issue_handler": "interactive_issue_handler",
+        }
+    )
+    
+    # Flow from create_cleaning_code
+    workflow.add_edge("create_cleaning_code", "execute_cleaning_code")
+    
+    # Conditional edges from execute_cleaning_code
+    def should_fix_code(state):
+        return (
+            state.get("data_cleaner_error") is not None
+            and state.get("retry_count", 0) < state.get("max_retries", 3)
+        )
+    
+    workflow.add_conditional_edges(
+        "execute_cleaning_code",
+        lambda state: "fix_cleaning_code" if should_fix_code(state) else "check_more_issues",
+        {
+            "fix_cleaning_code": "fix_cleaning_code",
+            "check_more_issues": "check_more_issues",
+        }
+    )
+    
+    # Flow from fix_cleaning_code back to execute
+    workflow.add_edge("fix_cleaning_code", "execute_cleaning_code")
+    
+    # Conditional edges from check_more_issues
+    workflow.add_conditional_edges(
+        "check_more_issues",
+        lambda state: "interactive_issue_handler" if state.get("current_issue_index", 0) < len(state.get("detected_issues", [])) else "report_agent_outputs",
+        {
+            "interactive_issue_handler": "interactive_issue_handler",
+            "report_agent_outputs": "report_agent_outputs",
+        }
+    )
+    
+    # Final edge to END
+    workflow.add_edge("report_agent_outputs", END)
+    
+    # Compile the workflow
+    app = workflow.compile(
         checkpointer=checkpointer,
-        bypass_recommended_steps=False,
-        bypass_explain_code=True,
-        agent_name=AGENT_NAME,
+        name=AGENT_NAME,
     )
 
     return app

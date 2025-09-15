@@ -1,5 +1,6 @@
 from ai_data_science_team.agents import (
     DataCleaningAgent,
+    InteractiveDataCleaningAgent,
     DataLoaderToolsAgent,
     DataVisualizationAgent,
     BayesianOptimizationAgent,

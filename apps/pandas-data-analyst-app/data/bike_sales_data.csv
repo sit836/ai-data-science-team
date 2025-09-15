@@ -1,8 +1,8 @@
 date,bike_model,price,quantity_sold,extended_sales
-2021/1/1,Commuter Swift,,23,11385
-2021/1/1,Urban Rider,350,,6650
-2021/1/1,Urban Rider,350,,6650
-2021/1/1,City Cruiser,400,19,
+2021/1/1,Commuter Swift,1,23,11385
+2021/1/1,Urban Rider,350,11,6650
+2021/1/1,Urban Rider,350,111,6650
+2021/1/1,City Cruiser,400,19,123
 2021/1/1,Mountain Trail Pro,1250,11,13750
 2021/1/1,Gravel Explorer,2200,9,19800
 2021/1/1,Roadster GT,2900,12,34800
