@@ -1,6 +1,9 @@
 import os
 import sys
 
+# Add the project root to Python path to ensure we import the local version
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -11,8 +14,6 @@ from ai_data_science_team import BayesianOptimizationAgent
 load_dotenv()
 
 MODEL = "deepseek-chat"
-LOG = True
-LOG_PATH = os.path.join(os.getcwd(), "logs/")
 
 # 增大 tokens，减少 JSON 截断概率
 llm = ChatOpenAI(
@@ -36,16 +37,19 @@ def run_auto(data_file: str, user_instructions: str, scenario_name: str):
 
     agent = BayesianOptimizationAgent(
         model=llm,
-        log=LOG,
-        log_path=LOG_PATH,
         human_in_the_loop=False,
-        bypass_recommended_steps=False,
         n_initial_points=3,
     )
 
     print(f"\nUser instructions: {user_instructions}")
 
-    agent.invoke_agent(user_instructions=user_instructions, data_raw=df)
+    # Convert DataFrame to the expected format
+    input_data = {
+        "X": df.drop(columns=[df.columns[-1]]).values,  # All columns except the last one
+        "Y": df.iloc[:, -1].values,  # Last column as target
+        "columns": list(df.columns)
+    }
+    agent.invoke_agent(input_data=input_data, user_instructions=user_instructions)
 
     print("\n--- Optimization Results ---")
     results = agent.get_optimization_results()
@@ -121,10 +125,7 @@ def run_hitl(data_file: str, user_instructions: str, scenario_name: str):
 
     agent = BayesianOptimizationAgent(
         model=llm,
-        log=LOG,
-        log_path=LOG_PATH,
         human_in_the_loop=True,  # 开启人机协同
-        bypass_recommended_steps=False,
         n_initial_points=3,
     )
 
@@ -133,9 +134,16 @@ def run_hitl(data_file: str, user_instructions: str, scenario_name: str):
 
     print(f"\nUser instructions: {user_instructions}")
 
+    # Convert DataFrame to the expected format
+    input_data = {
+        "X": df.drop(columns=[df.columns[-1]]).values,  # All columns except the last one
+        "Y": df.iloc[:, -1].values,  # Last column as target
+        "columns": list(df.columns)
+    }
+    
     # 第一次调用：图会在 human_review 节点中断并返回给用户
     try:
-        agent.invoke_agent(user_instructions=user_instructions, data_raw=df, config=config)
+        agent.invoke_agent(input_data=input_data, user_instructions=user_instructions, config=config)
         # 若未中断直接完成，也能继续展示结果
     except Exception as e:
         # 某些运行时可能通过异常暴露中断；继续走恢复流程
@@ -147,10 +155,10 @@ def run_hitl(data_file: str, user_instructions: str, scenario_name: str):
     for round_idx in range(3):
         user_text = input("你的输入: ")
         try:
-            agent.invoke(Command(resume=user_text), config=config)
+            agent._compiled_graph.invoke(Command(resume=user_text), config=config)
             # 如果是修改意见，自动再发送一次 yes 进行确认，避免用户二次输入
             if user_text.strip().lower() != "yes":
-                agent.invoke(Command(resume="yes"), config=config)
+                agent._compiled_graph.invoke(Command(resume="yes"), config=config)
         except Exception as e:
             print(f"恢复执行失败：{e}")
             return

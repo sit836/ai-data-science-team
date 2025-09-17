@@ -1,12 +1,11 @@
 import operator
-import os
 from typing import Any, Optional, Annotated, Sequence, List, Dict, TypedDict
+
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
+from langchain_core.messages import BaseMessage
 from langgraph.graph import START, END, StateGraph
-from langgraph.prebuilt import create_react_agent
 from langgraph.types import Checkpointer
 from scipy.optimize import minimize
 from scipy.stats import norm
@@ -15,13 +14,9 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
 from ai_data_science_team.templates import BaseAgent
 
-# 加载环境变量
 load_dotenv()
 
 AGENT_NAME = "bayesian_optimization_agent"
-
-# 定义可用列名
-AVAILABLE_COLUMNS = ['特征1', '特征2', '特征3', '特征4', '特征5', '目标值']
 
 
 class BayesianOptimizer:
@@ -254,9 +249,10 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
                 data_info["target_col"] = target_col
         else:
             # 如果没有数据，使用默认设置
+            available_columns = ['特征1', '特征2', '特征3', '特征4', '特征5', '目标值']
             data_info = {
-                "columns": AVAILABLE_COLUMNS,
-                "n_features": len(AVAILABLE_COLUMNS) - 1
+                "columns": available_columns,
+                "n_features": len(available_columns) - 1
             }
         
         # 通过智能对话获取配置
