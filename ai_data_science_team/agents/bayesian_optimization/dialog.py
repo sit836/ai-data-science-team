@@ -68,7 +68,23 @@ class ConsultativeConfigurator:
         self.model = model
         self.data_info = data_info
         self.human_in_the_loop = human_in_the_loop
-        self.available_columns = data_info.get("columns", [])
+        columns = data_info.get("columns", []) or []
+        self.available_columns = [str(col) for col in columns]
+        self._available_column_map = {col.casefold(): col for col in self.available_columns}
+        self._keep_existing_keywords = [
+            "保留",
+            "沿用",
+            "保持",
+            "不变",
+            "一样",
+            "维持",
+            "沿袭",
+            "和之前一样",
+            "上次",
+            "原来的",
+            "same",
+            "不用改",
+        ]
         self.history: List[ConversationTurn] = []
         self.context_notes: Dict[str, Any] = {}
         self.current_config: Dict[str, Any] = {
@@ -129,46 +145,137 @@ class ConsultativeConfigurator:
         intro_prompt = (
             "\u60A8\u597D\uff0c\u6211\u662F\u8D1D\u53F6\u65AF\u4F18\u5316\u54A8\u8BE2\u987E\u95EE\u3002\n"
             "\u6211\u4F1A\u548C\u60A8\u4E00\u8D77\u68B3\u7406\u76EE\u6807\u3001\u6570\u636E\u548C\u7EA6\u675F\uFF0C\u7136\u540E\u518D\u542F\u52A8\u4F18\u5316\u6D41\u7A0B\u3002\n"
-            "\u5982\u679C\u5728\u8FC7\u7A0B\u4E2D\u5BF9\u6211\u7684\u95EE\u9898\u6709\u7591\u95EE\uFF0C\u53EF\u4EE5\u968F\u65F6\u5148\u95EE\u6211\u3002"
+            "\u5982\u679C\u5728\u8FC7\u7A0B\u4E2D\u5BF9\u6211\u7684\u95EE\u9898\u6709\u7591\u95EE\uFF0C\u53EF\u4EE5\u968F\u65F6\u5148\u95EE\u6211\u3002\n\n"
+            "\u4E3A\u4E86\u5F00\u59CB\uFF0C\u8BF7\u5148\u7B80\u8981\u4ECB\u7ECD\u5F53\u524D\u60F3\u8981\u4F18\u5316\u7684\u76EE\u6807\u3001\u5DF2\u6709\u7684\u63A2\u7D22\u4EE5\u53CA\u9700\u8981\u6CE8\u610F\u7684\u7EA6\u675F\u3002"
         )
         response = self._prompt_user(intro_prompt, stage="intro", allow_empty=True)
-        if response:
+        cleaned = response.strip() if response else ""
+        if cleaned:
             self.history.append(ConversationTurn("intro", intro_prompt, response))
-            self.context_notes["initial_comment"] = response
+            self.context_notes["initial_comment"] = cleaned
+            if not self.context_notes.get("overview"):
+                self.context_notes["overview"] = cleaned
+                self.confidence["context"] = 0.8 if len(cleaned) < 15 else 0.9
+        elif response is not None:
+            self.history.append(ConversationTurn("intro", intro_prompt, response, {"status": "empty"}))
         self._intro_done = True
 
     def _gather_context(self) -> None:
+        existing = self.context_notes.get("overview")
+        if existing:
+            summary = existing.strip()
+            prompt = (
+                f"我目前记录的背景是：{summary or '（尚未记录）'}。\n"
+                "是否还有其他关键约束或补充信息？如果没有，可以回复‘没有’或直接按回车。"
+            )
+            response = self._prompt_user(prompt, stage="context", allow_empty=True)
+            normalized = response.strip() if response else ""
+            has_addition = bool(normalized) and not any(
+                phrase in normalized for phrase in ["没有", "無", "无", "没了", "none", "nothing"]
+            )
+            if has_addition:
+                updated = f"{summary}\n{normalized}" if summary else normalized
+                self.context_notes["overview"] = updated
+                self.confidence["context"] = 0.9
+                self.history.append(
+                    ConversationTurn("context_followup", prompt, response, {"updated": True})
+                )
+            else:
+                self.history.append(
+                    ConversationTurn("context_followup", prompt, response, {"updated": False})
+                )
+            return
         prompt = (
-            "\u4E3A\u4E86\u786E\u4FDD\u6211\u7406\u89E3\u4E1A\u52A1\u80CC\u666F\uFF0C\u80FD\u548C\u6211\u5206\u4EAB\u4E00\u4E0B\u5F53\u524D\u7684\u76EE\u6807\u3001\u5DF2\u6709\u63A2\u7D22\u4EE5\u53CA\u5173\u952E\u7EA6\u675F\u5417\uFF1F\n"
-            "\u53EF\u4EE5\u81EA\u7531\u63CF\u8FF0\uFF0C\u6211\u4F1A\u5E2E\u60A8\u6574\u7406\u8981\u70B9\u3002"
+            "为了确保我理解业务背景，能和我分享一下当前的目标、已有探索以及关键约束吗？\n"
+            "可以自由描述，我会帮您整理要点。"
         )
         response = self._prompt_user(prompt, stage="context")
-        self.context_notes["overview"] = response
-        self.confidence["context"] = 0.8 if len(response) < 15 else 0.9
+        normalized = response.strip()
+        self.context_notes["overview"] = normalized
+        self.confidence["context"] = 0.8 if len(normalized) < 15 else 0.9
         self.history.append(ConversationTurn("context", prompt, response))
 
     def _gather_input_variables(self) -> None:
         existing = self.current_config.get("input_variables") or []
-        available = ", ".join(self.available_columns) if self.available_columns else "\uFF08\u672A\u63D0\u4F9B\u5217\u4FE1\u606F\uFF09"
+        available_display = ", ".join(self.available_columns) if self.available_columns else "（未提供列信息）"
         base_prompt = (
-            "\u6211\u4EEC\u6765\u786E\u5B9A\u9700\u8981\u4F18\u5316\u7684\u8F93\u5165\u53D8\u91CF\u3002\n"
-            f"\u53EF\u9009\u5B57\u6BB5\uFF1A{available}\u3002\n"
-            "\u53EF\u4EE5\u76F4\u63A5\u544A\u8BC9\u6211\u8981\u5173\u6CE8\u54EA\u4E9B\u53D8\u91CF\uFF0C\u5982\u679C\u60F3\u4FDD\u7559\u4E0A\u4E00\u6B21\u7684\u9009\u62E9\uFF0C\u4E5F\u8BF7\u8BF4\u660E\u3002"
+            "我们来确定需要优化的输入变量。\n"
+            f"可选字段：{available_display}。\n"
+            "可以直接告诉我要关注哪些变量，如果想保留上一次的选择，也请说明。"
         )
         if existing:
-            base_prompt += f"\n\uFF08\u4E0A\u6B21\u8BB0\u5F55\uFF1A{', '.join(existing)}\uFF09"
+            formatted_existing = ", ".join(existing)
+            base_prompt += f"\n（上次记录：{formatted_existing}）"
         while True:
             response = self._prompt_user(base_prompt, stage="inputs")
-            variables = self._parse_variables(response)
-            if variables:
-                self.current_config["input_variables"] = variables
-                self.confidence["input_variables"] = 0.85
-                self.history.append(ConversationTurn("inputs", base_prompt, response, {"parsed": variables}))
-                break
-            base_prompt = (
-                "\u6211\u6682\u65F6\u6CA1\u80FD\u63D0\u53D6\u51FA\u5177\u4F53\u7684\u8F93\u5165\u53D8\u91CF\u3002\n"
-                "\u8BF7\u518D\u8BF4\u660E\u4E00\u6B21\uFF0C\u6216\u8005\u4F7F\u7528\u53D8\u91CF\u540D\u79F0\u95F4\u7528\u9017\u53F7\u6216\u7A7A\u683C\u9694\u5F00\u3002"
+            normalized = response.strip() if response else ""
+            normalized_cf = normalized.casefold() if normalized else ""
+            keep_existing = bool(existing) and normalized_cf and any(
+                keyword.casefold() in normalized_cf for keyword in self._keep_existing_keywords
             )
+            raw_tokens = self._parse_variables(response)
+            if keep_existing:
+                resolved = list(existing)
+                unmatched = []
+                source = "keep_existing"
+            else:
+                resolved, unmatched = self._resolve_input_tokens(raw_tokens)
+                source = "user_input"
+            if resolved:
+                self.current_config["input_variables"] = resolved
+                self.confidence["input_variables"] = 0.9 if not unmatched else 0.85
+                notes = {"parsed": resolved, "source": source}
+                if raw_tokens:
+                    notes["parsed_tokens"] = raw_tokens
+                if unmatched:
+                    notes["unmatched"] = unmatched
+                self.history.append(ConversationTurn("inputs", base_prompt, response, notes))
+                break
+            goal_hint = self._parse_goal(response)
+            retry_notes = {"status": "retry"}
+            if raw_tokens:
+                retry_notes["parsed_tokens"] = raw_tokens
+            if unmatched:
+                retry_notes["unmatched"] = unmatched
+            if goal_hint:
+                retry_notes["hint"] = "goal_detected"
+            self.history.append(ConversationTurn("inputs_retry", base_prompt, response, retry_notes))
+            if goal_hint:
+                base_prompt = (
+                    "听起来您在描述优化方向，我们稍后会确认是最大化还是最小化。\n"
+                    f"现在请告诉我需要调节的输入变量名称，例如：{available_display}。"
+                )
+            elif unmatched and self.available_columns:
+                base_prompt = (
+                    f"我没有在已知字段中找到这些名称：{', '.join(unmatched)}。\n"
+                    f"可选字段：{available_display}。请再试一次，或说明这些字段是否有别名。"
+                )
+            else:
+                base_prompt = (
+                    "我暂时没能提取出具体的输入变量。\n"
+                    "请使用字段名（可以用逗号或空格分隔）再描述一次。"
+                )
+
+    def _resolve_input_tokens(self, tokens: List[str]) -> Tuple[List[str], List[str]]:
+        if not tokens:
+            return [], []
+        if not self._available_column_map:
+            resolved: List[str] = []
+            for token in tokens:
+                if token not in resolved:
+                    resolved.append(token)
+            return resolved, []
+        resolved: List[str] = []
+        unmatched: List[str] = []
+        for token in tokens:
+            key = token.casefold()
+            column = self._available_column_map.get(key)
+            if column:
+                if column not in resolved:
+                    resolved.append(column)
+            else:
+                unmatched.append(token)
+        return resolved, unmatched
 
     def _gather_output_variable(self) -> None:
         existing = self.current_config.get("output_variable")
@@ -400,14 +507,16 @@ class ConsultativeConfigurator:
 
     @staticmethod
     def _parse_bounds(text: str) -> Optional[Tuple[float, float]]:
-        matches = re.findall(r"-?\\d+(?:\\.\\d+)?", text)
+        cleaned = text.replace("，", ",")
+        for token in ("～", "〜", "~", "到"):
+            cleaned = cleaned.replace(token, " ")
+        matches = re.findall(r"-?\d+(?:\.\d+)?", cleaned)
         if len(matches) < 2:
             return None
         lower, upper = float(matches[0]), float(matches[1])
         if lower > upper:
             lower, upper = upper, lower
         return lower, upper
-
     @staticmethod
     def _is_positive(text: str) -> bool:
         lowered = text.lower()
@@ -468,3 +577,5 @@ def get_user_confirmation_via_chat_v2(
         human_in_the_loop=human_in_the_loop,
         fields_to_update=fields_to_update,
     )
+
+
