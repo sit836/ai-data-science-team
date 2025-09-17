@@ -1,7 +1,6 @@
 from typing import Any, Dict
 
-from langgraph.types import Checkpointer
-
+from langgraph.types import Checkpointer, Command
 from ai_data_science_team.templates import BaseAgent
 from .workflow import create_bayesian_optimization_agent
 
@@ -47,6 +46,38 @@ class BayesianOptimizationAgent(BaseAgent):
         self.response = None
         return make_bayesian_optimization_agent(**self._params)
 
+    def _handle_interrupts(
+        self,
+        result,
+        config=None,
+        **kwargs,
+    ):
+        if not isinstance(result, dict):
+            return result
+        if not self._params.get("human_in_the_loop", True):
+            return result
+        while result.get("__interrupt__"):
+            interrupts = result.get("__interrupt__") or []
+            prompt_text = None
+            for interrupt_event in reversed(interrupts):
+                prompt_text = getattr(interrupt_event, "value", None)
+                if prompt_text:
+                    break
+            if prompt_text is None:
+                prompt_text = "请输入后续指示："
+            print("\n" + str(prompt_text))
+            try:
+                user_reply = input("> ").strip()
+            except KeyboardInterrupt:
+                print("\n用户中断了对话流程。")
+                break
+            while user_reply == "":
+                user_reply = input("> ").strip()
+            result = self._compiled_graph.invoke(Command(resume=user_reply), config=config, **kwargs)
+            self.response = result
+            if not isinstance(result, dict):
+                break
+        return result
     def invoke_agent(
         self,
         input_data: Dict[str, Any],
@@ -54,15 +85,16 @@ class BayesianOptimizationAgent(BaseAgent):
         max_iterations: int = 10,
         **kwargs,
     ):
-        self.response = self._compiled_graph.invoke(
-            {
-                "user_instructions": user_instructions,
-                "input_data": input_data,
-                "max_iterations": max_iterations,
-                "optimization_results": [],
-            },
-            **kwargs,
-        )
+        config = kwargs.pop("config", None)
+        initial_state = {
+            "user_instructions": user_instructions,
+            "input_data": input_data,
+            "max_iterations": max_iterations,
+            "optimization_results": [],
+        }
+        result = self._compiled_graph.invoke(initial_state, config=config, **kwargs)
+        result = self._handle_interrupts(result, config=config, **kwargs)
+        self.response = result
         return None
 
     async def ainvoke_agent(
@@ -72,6 +104,7 @@ class BayesianOptimizationAgent(BaseAgent):
         max_iterations: int = 10,
         **kwargs,
     ):
+        config = kwargs.pop("config", None)
         self.response = await self._compiled_graph.ainvoke(
             {
                 "user_instructions": user_instructions,
@@ -79,6 +112,7 @@ class BayesianOptimizationAgent(BaseAgent):
                 "max_iterations": max_iterations,
                 "optimization_results": [],
             },
+            config=config,
             **kwargs,
         )
         return None
