@@ -255,8 +255,57 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
                 "n_features": len(available_columns) - 1
             }
         
+        # 非交互模式：自动推断配置并跳过确认
+        if not human_in_the_loop:
+            input_vars = []
+            variable_bounds = {}
+            output_var = "目标"
+
+            if state.get("input_data"):
+                X_data = state["input_data"].get("X")
+                cols = state["input_data"].get("columns")
+                if X_data is not None:
+                    if hasattr(X_data, "shape"):
+                        n_features = X_data.shape[1] if len(X_data.shape) > 1 else 1
+                    else:
+                        n_features = len(X_data[0]) if X_data and isinstance(X_data[0], (list, tuple)) else 1
+
+                    if cols and len(cols) >= n_features:
+                        input_vars = cols[:n_features]
+                        if len(cols) > n_features:
+                            output_var = cols[n_features]
+                    else:
+                        input_vars = [f"特征{i+1}" for i in range(n_features)]
+
+                    try:
+                        X_arr = np.array(X_data)
+                        if X_arr.ndim == 1:
+                            X_arr = X_arr.reshape(-1, 1)
+                        mins = X_arr.min(axis=0)
+                        maxs = X_arr.max(axis=0)
+                        for i, var in enumerate(input_vars):
+                            variable_bounds[var] = (float(mins[i]), float(maxs[i]))
+                    except Exception:
+                        for var in input_vars:
+                            variable_bounds[var] = (0.0, 1.0)
+                else:
+                    input_vars = ["特征1", "特征2"]
+                    for var in input_vars:
+                        variable_bounds[var] = (0.0, 1.0)
+
+            state["input_variables"] = input_vars
+            state["output_variable"] = output_var
+            state["optimization_goal"] = state.get("optimization_goal") or "maximize"
+            state["variable_bounds"] = variable_bounds
+            state["confirmed_settings"] = True
+            state["step"] = "optimize"
+            state["need_human_approval"] = False
+
+            print("\n配置已自动推断，跳过人工确认，开始优化…")
+            return state
+
         # 通过智能对话获取配置
-        config = get_user_confirmation_via_chat(None, data_info)  # 暂时不使用model参数
+        config = get_user_confirmation_via_chat(model, data_info)
         
         # 更新状态
         state["input_variables"] = config["input_variables"]
@@ -331,7 +380,7 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
             bounds_list.append(state["variable_bounds"][var])
 
         if state.get("optimizer_state") is None:
-            optimizer = BayesianOptimizer(bounds_list)
+            optimizer = BayesianOptimizer(bounds_list, n_initial_points=n_initial_points)
             # 如果有初始数据，初始化优化器
             if state.get("input_data") and "X" in state["input_data"] and "Y" in state["input_data"]:
                 X_data = state["input_data"]["X"]
@@ -505,7 +554,10 @@ def create_bayesian_optimization_agent(model: Any, n_initial_points: int = 5, hu
 
     # 定义流程
     workflow.add_edge(START, "setup")
-    workflow.add_edge("setup", "approval")
+    if human_in_the_loop:
+        workflow.add_edge("setup", "approval")
+    else:
+        workflow.add_edge("setup", "optimize")
 
     # 使用条件边处理审批结果
     def after_approval(state: AgentState):
